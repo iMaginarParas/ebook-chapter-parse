@@ -462,8 +462,8 @@ Clean Text:"""
         # Fix quote marks
         text = re.sub(r'"\s+', '"', text)
         text = re.sub(r'\s+"', '"', text)
-        text = re.sub(r''\s+', ''', text)
-        text = re.sub(r'\s+'', ''', text)
+        text = re.sub(r"'\s+", "'", text)
+        text = re.sub(r"\s+'", "'", text)
         
         # Step 2: Remove headers, footers, page numbers
         lines = text.split('\n')
