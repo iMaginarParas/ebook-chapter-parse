@@ -73,14 +73,31 @@ app.add_middleware(
 
 class EbookProcessor:
     def __init__(self):
-        # Initialize Replicate client with environment variable
-        api_token = os.environ.get("REPLICATE_API_TOKEN")
-        if not api_token:
-            raise ValueError("REPLICATE_API_TOKEN environment variable is required")
-        self.replicate_client = replicate.Client(api_token=api_token)
+        # Initialize Replicate client only when needed for AI processing
+        self.replicate_client = None
+        self._init_replicate_client()
+    
+    def _init_replicate_client(self):
+        """Initialize Replicate client if API token is available"""
+        try:
+            api_token = os.environ.get("REPLICATE_API_TOKEN")
+            if api_token:
+                self.replicate_client = replicate.Client(api_token=api_token)
+                logger.info("✅ Replicate client initialized successfully")
+            else:
+                logger.warning("⚠️ REPLICATE_API_TOKEN not found. AI cleaning will be disabled.")
+                self.replicate_client = None
+        except Exception as e:
+            logger.error(f"❌ Failed to initialize Replicate client: {e}")
+            self.replicate_client = None
     
     async def clean_chapter_text_with_ai(self, chapter_text: str, chapter_title: str) -> str:
         """Clean chapter text using GPT-4o-mini via Replicate"""
+        # Check if Replicate client is available
+        if not self.replicate_client:
+            logger.warning(f"Replicate client not available for {chapter_title}, using basic cleaning")
+            return self._basic_text_cleaning(chapter_text)
+        
         try:
             logger.info(f"Cleaning text for {chapter_title} using AI...")
             
@@ -172,7 +189,7 @@ Clean Text:"""
                         'cleaned_text': cleaned_text,  # Add cleaned version
                         'word_count': len(cleaned_text.split()),
                         'original_word_count': chapter['word_count'],
-                        'cleaned': True,
+                        'cleaned': bool(self.replicate_client),  # True if AI was used
                         'improvement_ratio': len(cleaned_text.split()) / chapter['word_count'] if chapter['word_count'] > 0 else 1.0
                     }
                     
@@ -289,79 +306,255 @@ Clean Text:"""
         return text.strip()
     
     def extract_chapters_from_pdf(self, pdf_path: str) -> List[Dict]:
-        """Extract chapters from PDF as clean, formatted text"""
-        try:
-            # Try with PyMuPDF first (better text extraction)
-            doc = fitz.open(pdf_path)
-            
-            # Skip first few pages (table of contents, copyright, etc.)
-            start_page = self._find_story_start_page(doc)
-            
-            # Extract all text first
-            full_text = ""
-            for page_num in range(start_page, len(doc)):
-                page = doc.load_page(page_num)
-                page_text = page.get_text()
-                
-                # Basic cleaning
-                page_text = self._clean_page_text(page_text)
-                
-                if page_text.strip():
-                    full_text += page_text + "\n\n"
-            
-            doc.close()
-            
-            # Split into chapters
-            chapters = self._split_into_chapters(full_text)
-            
-            return chapters
-            
-        except Exception as e:
-            logger.warning(f"PyMuPDF failed: {e}, trying PyPDF2...")
-            
-            # Fallback to PyPDF2
+        """Extract chapters from PDF with improved text extraction"""
+        # Try multiple extraction methods in order of quality
+        extraction_methods = [
+            ("PyMuPDF with layout preservation", self._extract_with_pymupdf_advanced),
+            ("PyMuPDF basic", self._extract_with_pymupdf_basic),
+            ("PyPDF2", self._extract_with_pypdf2)
+        ]
+        
+        for method_name, extraction_func in extraction_methods:
             try:
-                with open(pdf_path, 'rb') as file:
-                    pdf_reader = PyPDF2.PdfReader(file)
-                    full_text = ""
-                    
-                    # Skip first few pages
-                    start_page = max(3, len(pdf_reader.pages) // 20)
-                    
-                    for page_num in range(start_page, len(pdf_reader.pages)):
-                        page = pdf_reader.pages[page_num]
-                        page_text = page.extract_text()
-                        
-                        # Basic cleaning
-                        page_text = self._clean_page_text(page_text)
-                        
-                        if page_text.strip():
-                            full_text += page_text + "\n\n"
+                logger.info(f"Trying text extraction with: {method_name}")
+                full_text = extraction_func(pdf_path)
+                
+                if full_text and len(full_text.strip()) > 500:
+                    logger.info(f"✅ Successfully extracted {len(full_text)} characters using {method_name}")
                     
                     # Split into chapters
                     chapters = self._split_into_chapters(full_text)
                     
-                    return chapters
+                    if chapters:
+                        logger.info(f"✅ Created {len(chapters)} chapters")
+                        return chapters
+                    else:
+                        logger.warning(f"⚠️ No chapters found using {method_name}")
+                else:
+                    logger.warning(f"⚠️ Insufficient text extracted using {method_name}")
                     
-            except Exception as e2:
-                logger.error(f"Both PDF extraction methods failed: {e2}")
-                return []
+            except Exception as e:
+                logger.warning(f"❌ {method_name} failed: {e}")
+                continue
+        
+        logger.error("❌ All extraction methods failed")
+        return []
+    
+    def _extract_with_pymupdf_advanced(self, pdf_path: str) -> str:
+        """Advanced PyMuPDF extraction with layout preservation"""
+        doc = fitz.open(pdf_path)
+        start_page = self._find_story_start_page(doc)
+        full_text = ""
+        
+        for page_num in range(start_page, len(doc)):
+            page = doc.load_page(page_num)
+            
+            # Try different extraction methods for better quality
+            methods_to_try = [
+                # Method 1: Text with layout info
+                lambda p: p.get_text("text"),
+                # Method 2: Text blocks (preserves reading order better)
+                lambda p: self._extract_text_blocks(p),
+                # Method 3: Dictionary method (most detailed)
+                lambda p: self._extract_from_dict(p)
+            ]
+            
+            page_text = ""
+            for method in methods_to_try:
+                try:
+                    page_text = method(page)
+                    if page_text and len(page_text.strip()) > 50:
+                        break
+                except:
+                    continue
+            
+            if not page_text:
+                logger.warning(f"No text extracted from page {page_num}")
+                continue
+            
+            # Advanced cleaning for this page
+            page_text = self._advanced_page_cleaning(page_text)
+            
+            if page_text.strip():
+                full_text += page_text + "\n\n"
+        
+        doc.close()
+        return full_text
+    
+    def _extract_text_blocks(self, page) -> str:
+        """Extract text using text blocks method"""
+        blocks = page.get_text("blocks")
+        text_parts = []
+        
+        for block in blocks:
+            if len(block) >= 5 and block[4].strip():  # block[4] contains the text
+                text_parts.append(block[4].strip())
+        
+        return "\n".join(text_parts)
+    
+    def _extract_from_dict(self, page) -> str:
+        """Extract text using dictionary method for better structure"""
+        text_dict = page.get_text("dict")
+        text_parts = []
+        
+        for block in text_dict.get("blocks", []):
+            if "lines" in block:
+                for line in block["lines"]:
+                    line_text = ""
+                    for span in line.get("spans", []):
+                        if "text" in span:
+                            line_text += span["text"]
+                    if line_text.strip():
+                        text_parts.append(line_text.strip())
+        
+        return "\n".join(text_parts)
+    
+    def _extract_with_pymupdf_basic(self, pdf_path: str) -> str:
+        """Basic PyMuPDF extraction (fallback)"""
+        doc = fitz.open(pdf_path)
+        start_page = self._find_story_start_page(doc)
+        full_text = ""
+        
+        for page_num in range(start_page, len(doc)):
+            page = doc.load_page(page_num)
+            page_text = page.get_text()
+            page_text = self._clean_page_text(page_text)
+            
+            if page_text.strip():
+                full_text += page_text + "\n\n"
+        
+        doc.close()
+        return full_text
+    
+    def _extract_with_pypdf2(self, pdf_path: str) -> str:
+        """PyPDF2 extraction (last resort)"""
+        with open(pdf_path, 'rb') as file:
+            pdf_reader = PyPDF2.PdfReader(file)
+            full_text = ""
+            
+            # Skip first few pages
+            start_page = max(3, len(pdf_reader.pages) // 20)
+            
+            for page_num in range(start_page, len(pdf_reader.pages)):
+                page = pdf_reader.pages[page_num]
+                page_text = page.extract_text()
+                page_text = self._clean_page_text(page_text)
+                
+                if page_text.strip():
+                    full_text += page_text + "\n\n"
+        
+        return full_text
+    
+    def _advanced_page_cleaning(self, text: str) -> str:
+        """Advanced page text cleaning for better quality"""
+        if not text:
+            return ""
+        
+        # Step 1: Fix common OCR issues
+        # Fix broken words across lines (hyphenation)
+        text = re.sub(r'(\w+)-\s*\n\s*(\w+)', r'\1\2', text)
+        text = re.sub(r'(\w+)-\s+(\w+)', r'\1\2', text)
+        
+        # Fix spacing around punctuation
+        text = re.sub(r'\s+([.,!?;:])', r'\1', text)
+        text = re.sub(r'([.,!?;:])\s*([a-zA-Z])', r'\1 \2', text)
+        
+        # Fix quote marks
+        text = re.sub(r'"\s+', '"', text)
+        text = re.sub(r'\s+"', '"', text)
+        text = re.sub(r''\s+', ''', text)
+        text = re.sub(r'\s+'', ''', text)
+        
+        # Step 2: Remove headers, footers, page numbers
+        lines = text.split('\n')
+        cleaned_lines = []
+        
+        for line in lines:
+            line = line.strip()
+            
+            # Skip empty lines
+            if not line:
+                continue
+            
+            # Skip page numbers (standalone numbers)
+            if re.match(r'^\d+$', line):
+                continue
+            
+            # Skip common headers/footers
+            if re.match(r'^(Page\s+\d+|Chapter\s+\d+\s*$|\d+\s*$)', line, re.IGNORECASE):
+                continue
+            
+            # Skip very short lines that are likely artifacts
+            if len(line) < 3:
+                continue
+            
+            # Skip lines with mostly special characters
+            if len(re.sub(r'[a-zA-Z0-9\s]', '', line)) > len(line) * 0.5:
+                continue
+            
+            cleaned_lines.append(line)
+        
+        # Step 3: Reconstruct paragraphs
+        reconstructed = []
+        current_paragraph = ""
+        
+        for line in cleaned_lines:
+            # Check if this line starts a new paragraph
+            if (line[0].isupper() and len(current_paragraph) > 50) or \
+               re.match(r'^(Chapter|CHAPTER|\d+\.)', line) or \
+               (current_paragraph and line[0] in '"''):
+                
+                if current_paragraph:
+                    reconstructed.append(current_paragraph.strip())
+                current_paragraph = line
+            else:
+                # Continue current paragraph
+                if current_paragraph:
+                    # Add space if the previous line doesn't end with punctuation
+                    if not current_paragraph.rstrip().endswith(('.', '!', '?', ';', ':')):
+                        current_paragraph += " " + line
+                    else:
+                        current_paragraph += " " + line
+                else:
+                    current_paragraph = line
+        
+        # Add the last paragraph
+        if current_paragraph:
+            reconstructed.append(current_paragraph.strip())
+        
+        # Step 4: Final cleaning
+        result = "\n\n".join(reconstructed)
+        
+        # Remove excessive whitespace
+        result = re.sub(r'\s+', ' ', result)
+        result = re.sub(r'\n\s*\n\s*\n+', '\n\n', result)
+        
+        # Fix sentence spacing
+        result = re.sub(r'([.!?])\s*([A-Z])', r'\1 \2', result)
+        
+        return result.strip()
     
     def _find_story_start_page(self, doc) -> int:
-        """Find where the actual story starts by looking for common patterns"""
+        """Improved story start detection"""
         story_indicators = [
-            r'chapter\s+1',
-            r'chapter\s+one',
+            r'chapter\s+(?:1|one|i)\b',
             r'prologue',
-            r'part\s+one',
-            r'part\s+1',
+            r'part\s+(?:1|one|i)\b',
             r'once upon a time',
-            r'it was',
+            r'it was a',
             r'the story',
-            r'in the beginning'
+            r'in the beginning',
+            r'long ago',
+            r'many years'
         ]
         
-        for page_num in range(min(20, len(doc))):  # Check first 20 pages
+        # Content quality indicators
+        narrative_words = [
+            'said', 'asked', 'replied', 'thought', 'felt', 'saw', 'heard', 
+            'walked', 'ran', 'looked', 'smiled', 'laughed', 'cried', 'whispered'
+        ]
+        
+        for page_num in range(min(25, len(doc))):  # Check first 25 pages
             try:
                 page = doc.load_page(page_num)
                 text = page.get_text().lower()
@@ -369,43 +562,37 @@ Clean Text:"""
                 # Look for story indicators
                 for indicator in story_indicators:
                     if re.search(indicator, text):
+                        logger.info(f"Found story start indicator '{indicator}' on page {page_num}")
                         return page_num
                 
-                # If page has substantial narrative content (not just TOC/copyright)
-                if len(text) > 500 and self._is_narrative_text(text):
-                    return page_num
+                # Check content quality
+                if len(text) > 1000:  # Substantial content
+                    # Count narrative indicators
+                    narrative_count = sum(1 for word in narrative_words if word in text)
+                    sentence_count = len(re.findall(r'[.!?]+', text))
                     
+                    # Check for non-narrative patterns
+                    non_narrative_patterns = [
+                        r'table of contents', r'copyright', r'published by', r'isbn',
+                        r'all rights reserved', r'acknowledgments', r'dedication',
+                        r'about the author', r'index', r'bibliography'
+                    ]
+                    
+                    is_non_narrative = any(re.search(pattern, text) for pattern in non_narrative_patterns)
+                    
+                    # If it has good narrative content and isn't clearly non-narrative
+                    if narrative_count >= 3 and sentence_count > 20 and not is_non_narrative:
+                        logger.info(f"Found quality narrative content on page {page_num}")
+                        return page_num
+                        
             except Exception as e:
                 logger.warning(f"Error checking page {page_num}: {e}")
                 continue
         
-        # Default: skip first 5 pages
-        return min(5, len(doc) // 4)
-    
-    def _is_narrative_text(self, text: str) -> bool:
-        """Check if text appears to be narrative content"""
-        # Count sentences and narrative indicators
-        sentences = len(re.findall(r'[.!?]+', text))
-        narrative_words = len(re.findall(r'\b(said|asked|replied|thought|felt|saw|heard|walked|ran|looked)\b', text.lower()))
-        
-        # Check for common non-narrative patterns
-        non_narrative_patterns = [
-            r'table of contents',
-            r'copyright',
-            r'published by',
-            r'isbn',
-            r'all rights reserved',
-            r'acknowledgments',
-            r'dedication',
-            r'about the author'
-        ]
-        
-        for pattern in non_narrative_patterns:
-            if re.search(pattern, text.lower()):
-                return False
-        
-        # If it has many sentences and some narrative words, likely story content
-        return sentences > 10 and narrative_words > 5
+        # Default: skip first 10% of pages or 5 pages, whichever is larger
+        default_start = max(5, len(doc) // 10)
+        logger.info(f"Using default start page: {default_start}")
+        return default_start
     
     def _clean_page_text(self, text: str) -> str:
         """Clean and normalize page text"""
@@ -448,10 +635,14 @@ Clean Text:"""
         # Sort by position
         chapter_breaks.sort(key=lambda x: x[0])
         
+        logger.info(f"Found {len(chapter_breaks)} chapter markers")
+        
         if not chapter_breaks:
             # No chapters found, split by large gaps or treat as single chapter
             sections = re.split(r'\n\n\n+', text)
             sections = [section.strip() for section in sections if len(section.strip()) > 500]
+            
+            logger.info(f"No chapter markers found, splitting into {len(sections)} sections")
             
             for i, section in enumerate(sections):
                 chapters.append({
@@ -483,10 +674,17 @@ Clean Text:"""
                         'cleaned': False  # Mark as not cleaned yet
                     })
         
+        logger.info(f"Successfully created {len(chapters)} chapters")
         return chapters
 
-# Initialize processor
-processor = EbookProcessor()
+# Initialize processor - this should work even without Replicate token
+try:
+    processor = EbookProcessor()
+    logger.info("✅ EbookProcessor initialized successfully")
+except Exception as e:
+    logger.error(f"❌ Failed to initialize EbookProcessor: {e}")
+    # Create a fallback processor that only does basic processing
+    processor = None
 
 @app.get("/")
 async def root():
@@ -494,6 +692,8 @@ async def root():
     return {
         "message": "PDF Ebook Chapter Processor API",
         "version": "1.0.0",
+        "status": "✅ Running" if processor else "⚠️ Limited functionality",
+        "ai_enabled": bool(processor and processor.replicate_client),
         "endpoints": {
             "POST /process-pdf": "Upload PDF and extract chapters",
             "POST /process-pdf-with-ai": "Upload PDF, extract and clean chapters with AI (parallel processing)",
@@ -510,7 +710,12 @@ async def root():
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
-    return {"status": "healthy", "timestamp": datetime.now().isoformat()}
+    return {
+        "status": "healthy", 
+        "timestamp": datetime.now().isoformat(),
+        "processor_available": bool(processor),
+        "ai_enabled": bool(processor and processor.replicate_client)
+    }
 
 @app.post("/process-pdf", response_model=ProcessingResponse)
 async def process_pdf(file: UploadFile = File(...)):
@@ -520,6 +725,9 @@ async def process_pdf(file: UploadFile = File(...)):
     - **file**: PDF file to process (max 20MB)
     - Returns: Extracted chapters with basic cleaning
     """
+    if not processor:
+        raise HTTPException(status_code=500, detail="Processor not available")
+    
     start_time = datetime.now()
     
     try:
@@ -588,6 +796,9 @@ async def process_pdf_with_ai(file: UploadFile = File(...), max_concurrent: int 
     - **max_concurrent**: Maximum number of chapters to process simultaneously (default: 5)
     - Returns: Extracted chapters with AI-powered text cleaning
     """
+    if not processor:
+        raise HTTPException(status_code=500, detail="Processor not available")
+    
     start_time = datetime.now()
     
     try:
@@ -640,9 +851,11 @@ async def process_pdf_with_ai(file: UploadFile = File(...), max_concurrent: int 
                 ChapterResponse(**chapter) for chapter in cleaned_chapters
             ]
             
+            ai_status = "with AI" if processor.replicate_client else "with basic cleaning (AI unavailable)"
+            
             return ProcessingResponse(
                 success=True,
-                message=f"PDF processed with parallel AI cleaning. {ai_cleaned_count}/{len(cleaned_chapters)} chapters successfully cleaned with AI",
+                message=f"PDF processed {ai_status}. {ai_cleaned_count}/{len(cleaned_chapters)} chapters successfully cleaned with AI",
                 file_name=file.filename,
                 total_chapters=len(cleaned_chapters),
                 total_words=total_words,
@@ -702,15 +915,16 @@ if __name__ == "__main__":
     # Get port from environment variable (Railway provides this)
     port = int(os.environ.get("PORT", 8000))
     
-    # Verify Replicate token is set
-    if not os.environ.get("REPLICATE_API_TOKEN"):
-        print("❌ Replicate API token not found!")
-        print("Please set REPLICATE_API_TOKEN environment variable")
-        exit(1)
-    
     print("🚀 Starting PDF Ebook Chapter Processor API...")
-    print("🔑 Using Replicate for AI text cleaning")
-    print("🧹 AI-powered text cleaning with GPT-4o-mini")
+    print("🔑 Checking Replicate configuration...")
+    
+    # Check Replicate token
+    if os.environ.get("REPLICATE_API_TOKEN"):
+        print("✅ Replicate API token found - AI cleaning enabled")
+    else:
+        print("⚠️ Replicate API token not found - AI cleaning disabled, basic processing only")
+    
+    print("🧹 AI-powered text cleaning with GPT-4o-mini (when available)")
     print("📚 PDF ebook support: Text extraction + AI cleaning + chapter formatting")
     print(f"🌐 FastAPI server starting on port {port}...")
     
