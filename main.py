@@ -502,7 +502,7 @@ Clean Text:"""
             # Check if this line starts a new paragraph
             if (line[0].isupper() and len(current_paragraph) > 50) or \
                re.match(r'^(Chapter|CHAPTER|\d+\.)', line) or \
-               (current_paragraph and line[0] in '"''):
+               (current_paragraph and line[0] in '"\''):
                 
                 if current_paragraph:
                     reconstructed.append(current_paragraph.strip())
