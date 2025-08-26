@@ -716,14 +716,17 @@ async def download_chapters_json(chapters_data: Dict):
         logger.error(f"Error creating JSON download: {e}")
         raise HTTPException(status_code=500, detail=f"Error creating download: {str(e)}")
 
+# Add this at the very end of your main.py file, replace the existing uvicorn.run section:
+
 if __name__ == "__main__":
     import uvicorn
     
-    # Get port from environment variable
-    port = int(os.environ.get("PORT", 8000))
+    # Multiple ways to get port - Railway sometimes uses different env vars
+    port = int(os.environ.get("PORT", os.environ.get("PORT0", 8000)))
     
     print("🚀 Starting Improved PDF Ebook Chapter Processor API...")
-    print("🔧 Improvements: Better chapter detection, resource management, error handling")
+    print(f"🌐 Server starting on port {port}...")
+    print(f"🔧 Environment: {os.environ.get('RAILWAY_ENVIRONMENT', 'development')}")
     
     # Check Replicate token
     if os.environ.get("REPLICATE_API_TOKEN"):
@@ -731,96 +734,17 @@ if __name__ == "__main__":
     else:
         print("⚠️ Replicate API token not found - basic processing only")
     
-    print(f"🌐 Server starting on port {port}...")
-    
-    uvicorn.run(
-        app, 
-        host="0.0.0.0", 
-        port=port,
-        timeout_keep_alive=300,  # 5 minutes
-        timeout_graceful_shutdown=30
-    )
-            chapter_responses = [ChapterResponse(**chapter) for chapter in chapters]
-            
-            return ProcessingResponse(
-                success=True,
-                message=f"Successfully extracted {len(chapters)} chapters from PDF",
-                file_name=file.filename,
-                total_chapters=len(chapters),
-                total_words=total_words,
-                estimated_reading_time_minutes=reading_time,
-                chapters=chapter_responses,
-                processing_time_seconds=processing_time
-            )
-            
-        except HTTPException:
-            raise
-        except Exception as e:
-            logger.error(f"Error processing PDF: {e}")
-            raise HTTPException(status_code=500, detail=f"Processing error: {str(e)}")
-        finally:
-            # Clean up
-            if tmp_path and os.path.exists(tmp_path):
-                try:
-                    os.unlink(tmp_path)
-                except:
-                    pass
-            gc.collect()
-
-@app.post("/process-pdf-with-ai", response_model=ProcessingResponse)
-async def process_pdf_with_ai(file: UploadFile = File(...), max_concurrent: int = 2):
-    """Process PDF with AI cleaning - improved version"""
-    if not processor:
-        raise HTTPException(status_code=500, detail="Processor not available")
-    
-    async with processor.processing_lock:
-        start_time = datetime.now()
-        tmp_path = None
-        
-        try:
-            # Validate inputs
-            if not file.filename.lower().endswith('.pdf'):
-                raise HTTPException(status_code=400, detail="Only PDF files are supported")
-            
-            # Check file size
-            contents = await file.read()
-            if len(contents) > 25 * 1024 * 1024:
-                raise HTTPException(status_code=413, detail="File too large. Maximum size is 25MB")
-            
-            # Limit concurrent processing to prevent overload
-            max_concurrent = max(1, min(max_concurrent, 3))
-            
-            # Save to temporary file
-            with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
-                tmp_file.write(contents)
-                tmp_path = tmp_file.name
-            
-            # Extract chapters
-            logger.info("Extracting chapters from PDF...")
-            chapters = processor.extract_chapters_from_pdf(tmp_path)
-            
-            if not chapters:
-                raise HTTPException(
-                    status_code=422, 
-                    detail="Could not extract readable chapters. The PDF may be image-based or have poor text quality."
-                )
-            
-            # Limit number of chapters to prevent timeout
-            if len(chapters) > 15:
-                logger.warning(f"Limiting processing to first 15 chapters (found {len(chapters)})")
-                chapters = chapters[:15]
-            
-            logger.info(f"Processing {len(chapters)} chapters with AI cleaning...")
-            
-            # Clean chapters with AI
-            cleaned_chapters = await processor.clean_all_chapters_parallel(chapters, max_concurrent)
-            
-            # Calculate stats
-            total_words = sum(ch.get('word_count', 0) for ch in cleaned_chapters)
-            reading_time = total_words / 200
-            processing_time = (datetime.now() - start_time).total_seconds()
-            
-            # Count successful cleanings
-            ai_cleaned_count = sum(1 for ch in cleaned_chapters if ch.get('cleaned', False))
-            
-            # Convert to response format
+    try:
+        uvicorn.run(
+            "main:app",  # Use string instead of app object
+            host="0.0.0.0", 
+            port=port,
+            workers=1,
+            timeout_keep_alive=300,
+            timeout_graceful_shutdown=30,
+            log_level="info",
+            access_log=True
+        )
+    except Exception as e:
+        print(f"❌ Server startup failed: {e}")
+        raise
