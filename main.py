@@ -60,8 +60,8 @@ class ErrorResponse(BaseModel):
 # Initialize FastAPI app
 app = FastAPI(
     title="PDF Ebook Chapter Processor",
-    description="Extract and clean chapters from PDF ebooks using AI",
-    version="1.0.0"
+    description="Extract and clean chapters from PDF ebooks using AI - Railway Optimized",
+    version="1.2.0"
 )
 
 # Add CORS middleware
@@ -77,7 +77,7 @@ class EbookProcessor:
     def __init__(self):
         self.replicate_client = None
         self._init_replicate_client()
-        self.processing_lock = asyncio.Semaphore(3)  # Limit concurrent processing
+        self.processing_lock = asyncio.Semaphore(2)  # Reduced for Railway
         
     def _init_replicate_client(self):
         """Initialize Replicate client if API token is available"""
@@ -93,8 +93,8 @@ class EbookProcessor:
             logger.error(f"❌ Failed to initialize Replicate client: {e}")
             self.replicate_client = None
 
-    async def clean_chapter_text_with_ai(self, chapter_text: str, chapter_title: str, retries: int = 2) -> str:
-        """Clean chapter text using GPT-4o-mini via Replicate with retry logic"""
+    async def clean_chapter_text_with_ai(self, chapter_text: str, chapter_title: str, retries: int = 1) -> str:
+        """Clean chapter text using GPT-4o-mini via Replicate with Railway optimization"""
         if not self.replicate_client:
             logger.warning(f"Replicate client not available for {chapter_title}, using basic cleaning")
             return self._basic_text_cleaning(chapter_text)
@@ -103,8 +103,8 @@ class EbookProcessor:
             try:
                 logger.info(f"Cleaning text for {chapter_title} using AI (attempt {attempt + 1})...")
                 
-                # Truncate text if too long to avoid API limits
-                max_chars = 8000  # Conservative limit
+                # More aggressive truncation for Railway
+                max_chars = 6000  # Reduced for Railway
                 if len(chapter_text) > max_chars:
                     chapter_text = chapter_text[:max_chars] + "..."
                     logger.warning(f"Truncated chapter {chapter_title} to {max_chars} characters")
@@ -116,8 +116,7 @@ Text to clean:
 
 Cleaned text:"""
 
-                # Add timeout and error handling
-                cleaned_text = ""
+                # Reduced timeout for Railway
                 try:
                     loop = asyncio.get_event_loop()
                     with ThreadPoolExecutor(max_workers=1) as executor:
@@ -128,22 +127,22 @@ Cleaned text:"""
                                 "openai/gpt-4o-mini",
                                 input={
                                     "prompt": cleaning_prompt,
-                                    "max_tokens": 3000,
+                                    "max_tokens": 2000,  # Reduced
                                     "temperature": 0.1,
                                     "top_p": 0.9
                                 }
                             ):
-                                # Check for timeout (60 seconds max)
-                                if time.time() - timeout_start > 60:
+                                # Shorter timeout for Railway
+                                if time.time() - timeout_start > 30:  # 30 seconds
                                     logger.warning(f"AI cleaning timeout for {chapter_title}")
                                     break
                                 result += str(event)
                             return result
                         
-                        # Run with timeout
+                        # Shorter timeout
                         cleaned_text = await asyncio.wait_for(
                             loop.run_in_executor(executor, sync_replicate_call),
-                            timeout=70  # 70 second timeout
+                            timeout=35  # 35 second timeout
                         )
                     
                     cleaned_text = self._post_process_cleaned_text(cleaned_text)
@@ -157,33 +156,25 @@ Cleaned text:"""
                         
                 except asyncio.TimeoutError:
                     logger.warning(f"AI cleaning timeout for {chapter_title} on attempt {attempt + 1}")
-                    if attempt == retries:
-                        return self._basic_text_cleaning(chapter_text)
-                    await asyncio.sleep(2 ** attempt)  # Exponential backoff
-                    continue
+                    return self._basic_text_cleaning(chapter_text)
                     
                 except Exception as ai_error:
                     logger.warning(f"AI cleaning failed for {chapter_title} on attempt {attempt + 1}: {ai_error}")
-                    if attempt == retries:
-                        return self._basic_text_cleaning(chapter_text)
-                    await asyncio.sleep(2 ** attempt)  # Exponential backoff
-                    continue
+                    return self._basic_text_cleaning(chapter_text)
                     
             except Exception as e:
                 logger.error(f"Error in AI text cleaning attempt {attempt + 1}: {e}")
-                if attempt == retries:
-                    return self._basic_text_cleaning(chapter_text)
-                await asyncio.sleep(2 ** attempt)
+                return self._basic_text_cleaning(chapter_text)
 
         return self._basic_text_cleaning(chapter_text)
 
-    async def clean_all_chapters_parallel(self, chapters: List[Dict], max_concurrent: int = 3) -> List[Dict]:
-        """Clean all chapters in parallel with improved error handling and resource management"""
+    async def clean_all_chapters_parallel(self, chapters: List[Dict], max_concurrent: int = 2) -> List[Dict]:
+        """Clean all chapters in parallel with Railway optimization"""
         if not chapters:
             return []
             
-        # Limit concurrent processing to prevent resource exhaustion
-        max_concurrent = min(max_concurrent, 3)  # Cap at 3 concurrent
+        # Strict limits for Railway
+        max_concurrent = min(max_concurrent, 2)  
         logger.info(f"Starting parallel AI cleaning for {len(chapters)} chapters with max {max_concurrent} concurrent tasks")
         
         # Create semaphore to limit concurrent API calls
@@ -205,7 +196,7 @@ Cleaned text:"""
                     cleaned_chapter = {
                         'chapter_number': chapter['chapter_number'],
                         'title': chapter['title'],
-                        'text': chapter['text'][:1000] + "..." if len(chapter['text']) > 1000 else chapter['text'],  # Truncate original for response
+                        'text': chapter['text'][:1000] + "..." if len(chapter['text']) > 1000 else chapter['text'],
                         'cleaned_text': cleaned_text,
                         'word_count': len(cleaned_text.split()),
                         'original_word_count': chapter['word_count'],
@@ -241,11 +232,11 @@ Cleaned text:"""
             logger.error("No valid chapters to process")
             return []
         
-        # Run all tasks concurrently with timeout
+        # Run all tasks concurrently with shorter timeout for Railway
         try:
             results = await asyncio.wait_for(
                 asyncio.gather(*tasks, return_exceptions=True),
-                timeout=300  # 5 minute total timeout
+                timeout=120  # 2 minute total timeout for Railway
             )
         except asyncio.TimeoutError:
             logger.error("Parallel processing timeout")
@@ -339,41 +330,59 @@ Cleaned text:"""
         return text.strip()
 
     def extract_chapters_from_pdf(self, pdf_path: str) -> List[Dict]:
-        """Improved chapter extraction with better patterns and validation"""
+        """Railway-optimized chapter extraction"""
         try:
-            # Use PyMuPDF as primary method
             doc = fitz.open(pdf_path)
             start_page = self._find_story_start_page(doc)
+            
+            # Process pages in smaller chunks to avoid memory issues
             full_text = ""
+            max_pages = min(80, len(doc) - start_page)  # Reduced for Railway
             
-            logger.info(f"Extracting text from pages {start_page} to {len(doc)}")
+            logger.info(f"Extracting text from pages {start_page} to {start_page + max_pages}")
             
-            for page_num in range(start_page, min(len(doc), start_page + 200)):  # Limit pages to prevent memory issues
+            for page_num in range(start_page, start_page + max_pages):
                 try:
                     page = doc.load_page(page_num)
                     page_text = page.get_text()
                     
+                    # Immediate cleanup to save memory
                     if page_text and len(page_text.strip()) > 20:
                         cleaned_page = self._clean_page_text(page_text)
-                        if cleaned_page:
+                        if cleaned_page and len(full_text) < 300000:  # 300KB text limit for Railway
                             full_text += cleaned_page + "\n\n"
-                            
+                    
+                    # Free page memory immediately
+                    page = None
+                    
                 except Exception as e:
                     logger.warning(f"Error extracting page {page_num}: {e}")
                     continue
             
             doc.close()
+            doc = None  # Explicit cleanup
             
             if not full_text or len(full_text.strip()) < 1000:
                 logger.error("Insufficient text extracted from PDF")
                 return []
             
-            # Split into chapters with improved logic
+            # Split into chapters
             chapters = self._split_into_chapters_improved(full_text)
             
-            if not chapters:
-                # Fallback: split by content sections
-                chapters = self._split_by_content(full_text)
+            # Cleanup
+            full_text = None
+            gc.collect()
+            
+            # Limit chapter count and size for Railway
+            if len(chapters) > 12:
+                chapters = chapters[:12]
+                logger.warning(f"Limited to first 12 chapters for Railway deployment")
+            
+            # Limit individual chapter size
+            for chapter in chapters:
+                if len(chapter['text']) > 30000:  # 30KB per chapter max
+                    chapter['text'] = chapter['text'][:30000] + "..."
+                    chapter['word_count'] = len(chapter['text'].split())
             
             return chapters
             
@@ -425,7 +434,7 @@ Cleaned text:"""
         
         if len(unique_breaks) < 2:
             logger.warning("Insufficient chapter markers found, trying content-based splitting")
-            return []
+            return self._split_by_content(text)
         
         # Extract chapters
         for i, (start_pos, title, indicator) in enumerate(unique_breaks):
@@ -462,7 +471,7 @@ Cleaned text:"""
         sections = [s.strip() for s in sections if len(s.strip()) > 1000]  # Increased minimum
         
         chapters = []
-        for i, section in enumerate(sections[:20]):  # Limit to 20 sections
+        for i, section in enumerate(sections[:15]):  # Limit to 15 sections for Railway
             # Try to find a good title from the beginning
             lines = section.split('\n')
             title = f"Section {i + 1}"
@@ -513,7 +522,7 @@ Cleaned text:"""
         
         content_indicators = ['said', 'asked', 'looked', 'walked', 'thought', 'felt']
         
-        for page_num in range(min(30, len(doc))):
+        for page_num in range(min(25, len(doc))):  # Reduced for Railway
             try:
                 page = doc.load_page(page_num)
                 text = page.get_text().lower()
@@ -591,28 +600,29 @@ except Exception as e:
 async def root():
     """Root endpoint with API information"""
     return {
-        "message": "PDF Ebook Chapter Processor API - Improved Version",
-        "version": "1.1.0",
+        "message": "PDF Ebook Chapter Processor API - Railway Optimized",
+        "version": "1.2.0",
         "status": "✅ Running" if processor else "⚠️ Limited functionality",
         "ai_enabled": bool(processor and processor.replicate_client),
-        "improvements": [
-            "Better chapter detection patterns",
-            "Improved text cleaning algorithms", 
-            "Resource management and timeout handling",
-            "Enhanced error handling and retries",
-            "Memory optimization",
-            "Fallback processing methods"
+        "optimizations": [
+            "Railway memory optimization",
+            "Reduced timeout handling", 
+            "Limited concurrent processing",
+            "Enhanced error handling",
+            "Memory cleanup and garbage collection",
+            "Smaller chunk processing"
         ]
     }
 
 @app.get("/health")
 async def health_check():
-    """Enhanced health check"""
+    """Enhanced health check for Railway"""
     return {
         "status": "healthy", 
         "timestamp": datetime.now().isoformat(),
         "processor_available": bool(processor),
         "ai_enabled": bool(processor and processor.replicate_client),
+        "environment": os.environ.get('RAILWAY_ENVIRONMENT', 'development'),
         "memory_info": {
             "garbage_collected": True
         }
@@ -620,11 +630,11 @@ async def health_check():
 
 @app.post("/process-pdf", response_model=ProcessingResponse)
 async def process_pdf(file: UploadFile = File(...)):
-    """Process PDF without AI cleaning"""
+    """Process PDF with Railway optimization"""
     if not processor:
         raise HTTPException(status_code=500, detail="Processor not available")
     
-    async with processor.processing_lock:  # Limit concurrent processing
+    async with processor.processing_lock:
         start_time = datetime.now()
         tmp_path = None
         
@@ -633,17 +643,18 @@ async def process_pdf(file: UploadFile = File(...)):
             if not file.filename.lower().endswith('.pdf'):
                 raise HTTPException(status_code=400, detail="Only PDF files are supported")
             
-            # Check file size
+            # Check file size - Railway has memory limits
             contents = await file.read()
-            if len(contents) > 25 * 1024 * 1024:  # Increased to 25MB
-                raise HTTPException(status_code=413, detail="File too large. Maximum size is 25MB")
+            if len(contents) > 12 * 1024 * 1024:  # 12MB limit for Railway
+                raise HTTPException(status_code=413, detail="File too large. Maximum size is 12MB")
             
             # Save to temporary file
             with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
                 tmp_file.write(contents)
                 tmp_path = tmp_file.name
             
-            # Extract chapters
+            # Extract chapters with timeout
+            logger.info(f"Extracting chapters from {file.filename}")
             chapters = processor.extract_chapters_from_pdf(tmp_path)
             
             if not chapters:
@@ -652,10 +663,47 @@ async def process_pdf(file: UploadFile = File(...)):
                     detail="Could not extract readable chapters. The PDF may be image-based or have poor text quality."
                 )
             
+            # Limit chapters to prevent timeouts on Railway
+            max_chapters = 8  # Reduced for Railway
+            if len(chapters) > max_chapters:
+                logger.warning(f"Limiting to first {max_chapters} chapters (found {len(chapters)})")
+                chapters = chapters[:max_chapters]
+            
+            # Process chapters with timeout protection
+            processing_timeout = 30  # Reduced timeout for Railway
+            
+            try:
+                cleaned_chapters = await asyncio.wait_for(
+                    processor.clean_all_chapters_parallel(chapters, max_concurrent=2),
+                    timeout=processing_timeout
+                )
+            except asyncio.TimeoutError:
+                logger.warning("AI processing timeout, using basic cleaning")
+                # Fallback to basic cleaning
+                cleaned_chapters = []
+                for i, chapter in enumerate(chapters):
+                    cleaned_text = processor._basic_text_cleaning(chapter['text'])
+                    cleaned_chapters.append({
+                        'chapter_number': chapter['chapter_number'],
+                        'title': chapter['title'],
+                        'text': chapter['text'][:1000] + "..." if len(chapter['text']) > 1000 else chapter['text'],
+                        'cleaned_text': cleaned_text,
+                        'word_count': len(cleaned_text.split()),
+                        'original_word_count': chapter['word_count'],
+                        'cleaned': False,
+                        'improvement_ratio': 1.0
+                    })
+            
+            if not cleaned_chapters:
+                raise HTTPException(status_code=500, detail="Failed to process any chapters")
+            
             # Calculate stats
-            total_words = sum(chapter['word_count'] for chapter in chapters)
-            reading_time = total_words / 200
+            total_words = sum(chapter.get('word_count', 0) for chapter in cleaned_chapters)
+            reading_time = total_words / 200 if total_words > 0 else 0
             processing_time = (datetime.now() - start_time).total_seconds()
+            
+            # Count AI cleaned chapters
+            ai_cleaned_count = sum(1 for chapter in cleaned_chapters if chapter.get('cleaned', False))
             
             # Convert to response format
             chapter_responses = [ChapterResponse(**chapter) for chapter in cleaned_chapters]
@@ -676,8 +724,8 @@ async def process_pdf(file: UploadFile = File(...)):
         except HTTPException:
             raise
         except Exception as e:
-            logger.error(f"Error processing PDF with AI: {e}")
-            raise HTTPException(status_code=500, detail=f"Processing error: {str(e)}")
+            logger.error(f"Error processing PDF: {e}")
+            raise HTTPException(status_code=500, detail=f"Processing error: {str(e)[:200]}")
         finally:
             # Clean up
             if tmp_path and os.path.exists(tmp_path):
@@ -685,6 +733,7 @@ async def process_pdf(file: UploadFile = File(...)):
                     os.unlink(tmp_path)
                 except:
                     pass
+            # Force garbage collection
             gc.collect()
 
 @app.post("/download-json")
@@ -695,7 +744,7 @@ async def download_chapters_json(chapters_data: Dict):
         json_data = {
             'metadata': {
                 'processed_at': datetime.now().isoformat(),
-                'processor': 'PDF Ebook Chapter Processor API v1.1',
+                'processor': 'PDF Ebook Chapter Processor API v1.2 - Railway Optimized',
                 'total_chapters': len(chapters_data.get('chapters', [])),
             },
             'data': chapters_data
@@ -716,17 +765,123 @@ async def download_chapters_json(chapters_data: Dict):
         logger.error(f"Error creating JSON download: {e}")
         raise HTTPException(status_code=500, detail=f"Error creating download: {str(e)}")
 
-# Add this at the very end of your main.py file, replace the existing uvicorn.run section:
+@app.post("/process-basic")
+async def process_pdf_basic_only(file: UploadFile = File(...)):
+    """Process PDF with basic cleaning only (no AI) - Faster for Railway"""
+    if not processor:
+        raise HTTPException(status_code=500, detail="Processor not available")
+    
+    start_time = datetime.now()
+    tmp_path = None
+    
+    try:
+        # Validate file
+        if not file.filename.lower().endswith('.pdf'):
+            raise HTTPException(status_code=400, detail="Only PDF files are supported")
+        
+        # Check file size
+        contents = await file.read()
+        if len(contents) > 15 * 1024 * 1024:  # 15MB limit
+            raise HTTPException(status_code=413, detail="File too large. Maximum size is 15MB")
+        
+        # Save to temporary file
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
+            tmp_file.write(contents)
+            tmp_path = tmp_file.name
+        
+        # Extract chapters
+        logger.info(f"Extracting chapters from {file.filename} (basic mode)")
+        chapters = processor.extract_chapters_from_pdf(tmp_path)
+        
+        if not chapters:
+            raise HTTPException(
+                status_code=422, 
+                detail="Could not extract readable chapters. The PDF may be image-based or have poor text quality."
+            )
+        
+        # Apply basic cleaning only
+        cleaned_chapters = []
+        for chapter in chapters:
+            cleaned_text = processor._basic_text_cleaning(chapter['text'])
+            cleaned_chapters.append({
+                'chapter_number': chapter['chapter_number'],
+                'title': chapter['title'],
+                'text': chapter['text'][:1000] + "..." if len(chapter['text']) > 1000 else chapter['text'],
+                'cleaned_text': cleaned_text,
+                'word_count': len(cleaned_text.split()),
+                'original_word_count': chapter['word_count'],
+                'cleaned': False,  # No AI cleaning
+                'improvement_ratio': len(cleaned_text.split()) / chapter['word_count'] if chapter['word_count'] > 0 else 1.0
+            })
+        
+        # Calculate stats
+        total_words = sum(chapter['word_count'] for chapter in cleaned_chapters)
+        reading_time = total_words / 200 if total_words > 0 else 0
+        processing_time = (datetime.now() - start_time).total_seconds()
+        
+        # Convert to response format
+        chapter_responses = [ChapterResponse(**chapter) for chapter in cleaned_chapters]
+        
+        return ProcessingResponse(
+            success=True,
+            message=f"Successfully processed {len(cleaned_chapters)} chapters with basic cleaning (no AI)",
+            file_name=file.filename,
+            total_chapters=len(cleaned_chapters),
+            total_words=total_words,
+            estimated_reading_time_minutes=reading_time,
+            chapters=chapter_responses,
+            processing_time_seconds=processing_time
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in basic processing: {e}")
+        raise HTTPException(status_code=500, detail=f"Processing error: {str(e)[:200]}")
+    finally:
+        # Clean up
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except:
+                pass
+        gc.collect()
 
+# Error handlers
+@app.exception_handler(413)
+async def request_entity_too_large_handler(request, exc):
+    return JSONResponse(
+        status_code=413,
+        content={
+            "success": False,
+            "error": "File too large",
+            "details": "Maximum file size is 12MB for Railway deployment"
+        }
+    )
+
+@app.exception_handler(500)
+async def internal_server_error_handler(request, exc):
+    return JSONResponse(
+        status_code=500,
+        content={
+            "success": False,
+            "error": "Internal server error",
+            "details": "Please try again with a smaller PDF or contact support"
+        }
+    )
+
+# Railway-specific startup configuration
 if __name__ == "__main__":
     import uvicorn
     
-    # Multiple ways to get port - Railway sometimes uses different env vars
-    port = int(os.environ.get("PORT", os.environ.get("PORT0", 8000)))
+    # Railway provides PORT environment variable
+    port = int(os.environ.get("PORT", 8000))
     
-    print("🚀 Starting Improved PDF Ebook Chapter Processor API...")
+    print("🚀 Starting Railway-Optimized PDF Ebook Chapter Processor API...")
     print(f"🌐 Server starting on port {port}...")
     print(f"🔧 Environment: {os.environ.get('RAILWAY_ENVIRONMENT', 'development')}")
+    print(f"💾 Memory optimizations: enabled")
+    print(f"⏱️  Timeouts: reduced for Railway")
     
     # Check Replicate token
     if os.environ.get("REPLICATE_API_TOKEN"):
@@ -736,14 +891,17 @@ if __name__ == "__main__":
     
     try:
         uvicorn.run(
-            "main:app",  # Use string instead of app object
+            app,  # Use app object directly
             host="0.0.0.0", 
             port=port,
-            workers=1,
-            timeout_keep_alive=300,
-            timeout_graceful_shutdown=30,
+            workers=1,  # Single worker for Railway memory constraints
+            timeout_keep_alive=30,  # Shorter keepalive
+            timeout_graceful_shutdown=15,  # Quick shutdown
             log_level="info",
-            access_log=True
+            access_log=True,
+            # Railway-specific optimizations
+            loop="asyncio",
+            http="auto"
         )
     except Exception as e:
         print(f"❌ Server startup failed: {e}")
