@@ -2,6 +2,7 @@ fastapi==0.104.1
 uvicorn[standard]==0.24.0
 PyPDF2==3.0.1
 pymupdf==1.23.26
+pdfminer.six==20231228
 replicate==0.22.0
 python-multipart==0.0.6
 pydantic==2.5.0
