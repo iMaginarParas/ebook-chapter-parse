@@ -1129,16 +1129,16 @@ Cleaned text:"""
             
             # Skip obvious page artifacts
             skip_patterns = [
-                r'^\d+,                          # Standalone page numbers
-                r'^Page\s+\d+',                    # "Page X" headers
-                r'^Chapter\s+\d+\s*,            # Standalone "Chapter X"
-                r'^\d+\s*,                       # Numbers only
-                r'^[^\w]*,                       # Only punctuation/symbols
-                r'.*copyright.*',                   # Copyright lines
-                r'.*all rights reserved.*',         # Rights lines
-                r'^www\.',                         # Website URLs
-                r'.*\.com.*',                      # More URLs
-                r'^\s*[-=_]{3,}\s*               # Separator lines
+                r'^\d+$',                        # Standalone page numbers
+                r'^Page\s+\d+',                  # "Page X" headers
+                r'^Chapter\s+\d+\s*$',           # Standalone "Chapter X"
+                r'^\d+\s*$',                     # Numbers only
+                r'^[^\w]+$',                     # Only punctuation/symbols
+                r'.*copyright.*',                # Copyright lines
+                r'.*all rights reserved.*',      # Rights lines
+                r'^www\.',                       # Website URLs
+                r'.*\.com.*',                    # More URLs
+                r'^\s*[-=_]{3,}\s*$',            # Separator lines
             ]
             
             if any(re.match(pattern, line, re.IGNORECASE) for pattern in skip_patterns):
