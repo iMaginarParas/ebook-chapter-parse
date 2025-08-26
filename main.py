@@ -870,18 +870,24 @@ async def internal_server_error_handler(request, exc):
         }
     )
 
-# Railway-specific startup configuration
+# Replace the startup section at the end of your main.py with this:
 if __name__ == "__main__":
     import uvicorn
     
-    # Railway provides PORT environment variable
-    port = int(os.environ.get("PORT", 8000))
+    # Railway port detection - try multiple environment variables
+    port = int(
+        os.environ.get("PORT") or 
+        os.environ.get("PORT0") or 
+        os.environ.get("HTTP_PORT") or 
+        "8000"
+    )
     
-    print("🚀 Starting Railway-Optimized PDF Ebook Chapter Processor API...")
-    print(f"🌐 Server starting on port {port}...")
+    print(f"🚀 Starting Railway-Optimized PDF Ebook Chapter Processor API...")
+    print(f"🌐 Server starting on 0.0.0.0:{port}...")
     print(f"🔧 Environment: {os.environ.get('RAILWAY_ENVIRONMENT', 'development')}")
     print(f"💾 Memory optimizations: enabled")
     print(f"⏱️  Timeouts: reduced for Railway")
+    print(f"🔍 Available env vars: PORT={os.environ.get('PORT')}, PORT0={os.environ.get('PORT0')}")
     
     # Check Replicate token
     if os.environ.get("REPLICATE_API_TOKEN"):
@@ -891,17 +897,15 @@ if __name__ == "__main__":
     
     try:
         uvicorn.run(
-            app,  # Use app object directly
+            app,
             host="0.0.0.0", 
             port=port,
-            workers=1,  # Single worker for Railway memory constraints
-            timeout_keep_alive=30,  # Shorter keepalive
-            timeout_graceful_shutdown=15,  # Quick shutdown
+            workers=1,
+            timeout_keep_alive=120,  # Increased for Railway
+            timeout_graceful_shutdown=30,
             log_level="info",
             access_log=True,
-            # Railway-specific optimizations
-            loop="asyncio",
-            http="auto"
+            # Remove Railway-specific settings that might cause issues
         )
     except Exception as e:
         print(f"❌ Server startup failed: {e}")
