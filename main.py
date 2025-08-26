@@ -872,40 +872,33 @@ async def internal_server_error_handler(request, exc):
 
 # Replace the startup section at the end of your main.py with this:
 if __name__ == "__main__":
+    import os
     import uvicorn
-    
-    # Railway port detection - try multiple environment variables
-    port = int(
-        os.environ.get("PORT") or 
-        os.environ.get("PORT0") or 
-        os.environ.get("HTTP_PORT") or 
-        "8000"
-    )
-    
-    print(f"🚀 Starting Railway-Optimized PDF Ebook Chapter Processor API...")
+
+    # Get the port from Railway or default to 8000 (for local dev)
+    port = int(os.environ.get("PORT", "8000"))
+
+    print("🚀 Starting Railway-Optimized PDF Ebook Chapter Processor API...")
     print(f"🌐 Server starting on 0.0.0.0:{port}...")
     print(f"🔧 Environment: {os.environ.get('RAILWAY_ENVIRONMENT', 'development')}")
     print(f"💾 Memory optimizations: enabled")
-    print(f"⏱️  Timeouts: reduced for Railway")
+    print(f"⏱️ Timeouts: reduced for Railway")
     print(f"🔍 Available env vars: PORT={os.environ.get('PORT')}, PORT0={os.environ.get('PORT0')}")
-    
+
     # Check Replicate token
     if os.environ.get("REPLICATE_API_TOKEN"):
         print("✅ Replicate API token found - AI cleaning enabled")
     else:
         print("⚠️ Replicate API token not found - basic processing only")
-    
+
     try:
         uvicorn.run(
-            app,
-            host="0.0.0.0", 
+            "main:app",   # safer than passing `app` directly for some deployments
+            host="0.0.0.0",
             port=port,
             workers=1,
-            timeout_keep_alive=120,  # Increased for Railway
-            timeout_graceful_shutdown=30,
             log_level="info",
             access_log=True,
-            # Remove Railway-specific settings that might cause issues
         )
     except Exception as e:
         print(f"❌ Server startup failed: {e}")
