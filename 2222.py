@@ -613,69 +613,62 @@ Clean Text:"""
         return text.strip()
     
     def _split_into_chapters(self, text: str) -> List[Dict]:
-        """Split text into chapters with clean formatting"""
-        chapters = []
-        
-        # Look for chapter markers
-        chapter_patterns = [
-            r'(?i)(chapter\s+\d+)',
-            r'(?i)(chapter\s+\w+)',
-            r'(?i)(part\s+\d+)',
-            r'(?i)(part\s+\w+)',
-            r'(?i)(prologue)',
-            r'(?i)(epilogue)'
-        ]
-        
-        # Find all chapter markers
-        chapter_breaks = []
-        for pattern in chapter_patterns:
-            for match in re.finditer(pattern, text):
-                chapter_breaks.append((match.start(), match.group().strip()))
-        
-        # Sort by position
-        chapter_breaks.sort(key=lambda x: x[0])
-        
-        logger.info(f"Found {len(chapter_breaks)} chapter markers")
-        
-        if not chapter_breaks:
-            # No chapters found, split by large gaps or treat as single chapter
-            sections = re.split(r'\n\n\n+', text)
-            sections = [section.strip() for section in sections if len(section.strip()) > 500]
-            
-            logger.info(f"No chapter markers found, splitting into {len(sections)} sections")
-            
-            for i, section in enumerate(sections):
-                chapters.append({
-                    'chapter_number': i + 1,
-                    'title': f"Section {i + 1}",
-                    'text': section,
-                    'word_count': len(section.split()),
-                    'cleaned': False  # Mark as not cleaned yet
-                })
-        else:
-            # Extract chapters based on markers
-            for i, (start_pos, title) in enumerate(chapter_breaks):
-                # Determine end position
-                if i + 1 < len(chapter_breaks):
-                    end_pos = chapter_breaks[i + 1][0]
-                else:
-                    end_pos = len(text)
-                
-                # Extract chapter text
-                chapter_text = text[start_pos:end_pos].strip()
-                
-                # Clean and format the chapter
-                if len(chapter_text) > 200:  # Only include substantial chapters
-                    chapters.append({
-                        'chapter_number': i + 1,
-                        'title': title,
-                        'text': chapter_text,
-                        'word_count': len(chapter_text.split()),
-                        'cleaned': False  # Mark as not cleaned yet
-                    })
-        
-        logger.info(f"Successfully created {len(chapters)} chapters")
+    """Split text into chapters with flexible detection"""
+    chapters = []
+
+    # Improved chapter regex patterns (handles numbers, Roman numerals, words, prologue/epilogue)
+    chapter_patterns = [
+        r'(?i)(?:^|\n)\s*(chapter\s+\d+)(?:\s|$)',
+        r'(?i)(?:^|\n)\s*(chapter\s+[ivxlcdm]+)(?:\s|$)',   # Roman numerals
+        r'(?i)(?:^|\n)\s*(chapter\s+\w+)(?:\s|$)',          # Word form (One, Two, Three...)
+        r'(?i)(?:^|\n)\s*(prologue)(?:\s|$)',
+        r'(?i)(?:^|\n)\s*(epilogue)(?:\s|$)',
+        r'(?i)(?:^|\n)\s*(part\s+\d+)(?:\s|$)',
+        r'(?i)(?:^|\n)\s*(part\s+[ivxlcdm]+)(?:\s|$)',
+        r'(?i)(?:^|\n)\s*(part\s+\w+)(?:\s|$)'
+    ]
+
+    # Combine into one big regex
+    combined_pattern = re.compile("|".join(chapter_patterns), re.IGNORECASE)
+
+    # Find all chapter markers
+    matches = list(combined_pattern.finditer(text))
+    logger.info(f"📖 Found {len(matches)} potential chapter markers")
+
+    if not matches:
+        # No clear chapters found → split by large gaps
+        sections = re.split(r'\n{3,}', text)
+        sections = [s.strip() for s in sections if len(s.strip()) > 500]
+        logger.info(f"⚠️ No chapter markers found, splitting into {len(sections)} sections")
+
+        for i, section in enumerate(sections):
+            chapters.append({
+                "chapter_number": i + 1,
+                "title": f"Section {i+1}",
+                "text": section,
+                "word_count": len(section.split()),
+                "cleaned": False
+            })
         return chapters
+
+    # Build chapter list based on matches
+    for i, match in enumerate(matches):
+        start = match.start()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+        chapter_text = text[start:end].strip()
+
+        if len(chapter_text) > 200:  # Avoid tiny matches
+            title = match.group().strip()
+            chapters.append({
+                "chapter_number": i + 1,
+                "title": title,
+                "text": chapter_text,
+                "word_count": len(chapter_text.split()),
+                "cleaned": False
+            })
+
+    logger.info(f"✅ Successfully split into {len(chapters)} chapters")
+    return chapters
 
 # Initialize processor - this should work even without Replicate token
 try:
