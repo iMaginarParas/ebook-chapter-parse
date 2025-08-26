@@ -1233,8 +1233,8 @@ Cleaned text:"""
         text = re.sub(r'\s+', ' ', text)
         
         # Remove page numbers and headers/footers
-        text = re.sub(r'^\d+\s*, '', text, flags=re.MULTILINE)
-        text = re.sub(r'^Page\s+\d+.*, '', text, flags=re.MULTILINE)
+        text = re.sub(r'^\d+\s*, ?', '', text, flags=re.MULTILINE)
+        text = re.sub(r'^Page\s+\d+.*', '', text, flags=re.MULTILINE)
         
         # Remove common OCR artifacts
         text = re.sub(r'[^\w\s.,!?;:"\'-]', '', text)
