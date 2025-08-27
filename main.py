@@ -35,12 +35,9 @@ logger = logging.getLogger(__name__)
 class PageBatchResponse(BaseModel):
     batch_number: int
     page_range: str  # e.g., "0-10", "10-20"
-    text: str
-    cleaned_text: Optional[str] = None
+    cleaned_text: str  # Only cleaned text - matches Flutter model
     word_count: int
-    original_word_count: Optional[int] = None
     cleaned: bool = False
-    improvement_ratio: Optional[float] = None
     pages_in_batch: int
 
 class ProcessingResponse(BaseModel):
@@ -173,7 +170,7 @@ class SimplePDFProcessor:
                             page_batches.append({
                                 'batch_number': batch_number,
                                 'page_range': page_range,
-                                'text': current_batch_text.strip(),
+                                'cleaned_text': current_batch_text.strip(),  # Use cleaned_text field
                                 'word_count': word_count,
                                 'pages_in_batch': pages_in_current_batch,
                                 'cleaned': False
@@ -234,7 +231,7 @@ class SimplePDFProcessor:
                                 page_batches.append({
                                     'batch_number': batch_number,
                                     'page_range': page_range,
-                                    'text': current_batch_text.strip(),
+                                    'cleaned_text': current_batch_text.strip(),  # Use cleaned_text field
                                     'word_count': word_count,
                                     'pages_in_batch': pages_in_current_batch,
                                     'cleaned': False
@@ -438,20 +435,20 @@ Clean Text:"""
         async def clean_single_batch(batch_index: int, batch: Dict) -> tuple[int, Dict]:
             async with semaphore:
                 try:
+                    # Get the text to clean
+                    text_to_clean = batch['cleaned_text']
+                    
                     cleaned_text = await self.clean_page_batch_text_with_ai(
-                        batch['text'], 
+                        text_to_clean, 
                         batch['page_range']
                     )
                     
                     cleaned_batch = {
                         'batch_number': batch['batch_number'],
                         'page_range': batch['page_range'],
-                        'text': batch['text'],
-                        'cleaned_text': cleaned_text,
+                        'cleaned_text': cleaned_text,  # Only cleaned_text field
                         'word_count': len(cleaned_text.split()),
-                        'original_word_count': batch['word_count'],
                         'cleaned': bool(self.replicate_client),
-                        'improvement_ratio': len(cleaned_text.split()) / batch['word_count'] if batch['word_count'] > 0 else 1.0,
                         'pages_in_batch': batch['pages_in_batch']
                     }
                     
@@ -459,19 +456,8 @@ Clean Text:"""
                     
                 except Exception as e:
                     logger.error(f"Error cleaning batch {batch_index}: {e}")
-                    # Return with basic cleaning on error
-                    fallback_batch = {
-                        'batch_number': batch['batch_number'],
-                        'page_range': batch['page_range'],
-                        'text': batch['text'],
-                        'cleaned_text': batch['text'],  # No cleaning
-                        'word_count': batch['word_count'],
-                        'original_word_count': batch['word_count'],
-                        'cleaned': False,
-                        'improvement_ratio': 1.0,
-                        'pages_in_batch': batch['pages_in_batch']
-                    }
-                    return (batch_index, fallback_batch)
+                    # Return original batch on error
+                    return (batch_index, batch)
         
         # Create tasks
         tasks = [clean_single_batch(i, batch) for i, batch in enumerate(page_batches)]
@@ -488,18 +474,7 @@ Clean Text:"""
                 logger.error(f"Exception in task {i}: {result}")
                 exceptions_count += 1
                 # Add fallback
-                batch = page_batches[i]
-                result_batches[i] = {
-                    'batch_number': batch['batch_number'],
-                    'page_range': batch['page_range'],
-                    'text': batch['text'],
-                    'cleaned_text': batch['text'],
-                    'word_count': batch['word_count'],
-                    'original_word_count': batch['word_count'],
-                    'cleaned': False,
-                    'improvement_ratio': 1.0,
-                    'pages_in_batch': batch['pages_in_batch']
-                }
+                result_batches[i] = page_batches[i]
             else:
                 index, cleaned_batch = result
                 result_batches[index] = cleaned_batch
