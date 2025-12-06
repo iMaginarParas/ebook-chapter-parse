@@ -11,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 import psutil
 
 # FastAPI imports
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, UploadFile, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -30,6 +30,44 @@ logging.basicConfig(
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+
+# ============================================================================
+# WEBSOCKET CONNECTION MANAGER
+# ============================================================================
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: Dict[str, WebSocket] = {}
+    
+    async def connect(self, websocket: WebSocket, client_id: str):
+        await websocket.accept()
+        self.active_connections[client_id] = websocket
+        logger.info(f"Client {client_id} connected. Total connections: {len(self.active_connections)}")
+    
+    def disconnect(self, client_id: str):
+        if client_id in self.active_connections:
+            del self.active_connections[client_id]
+            logger.info(f"Client {client_id} disconnected. Total connections: {len(self.active_connections)}")
+    
+    async def send_message(self, client_id: str, message: dict):
+        if client_id in self.active_connections:
+            try:
+                await self.active_connections[client_id].send_json(message)
+            except Exception as e:
+                logger.error(f"Error sending message to {client_id}: {e}")
+                self.disconnect(client_id)
+    
+    async def broadcast(self, message: dict):
+        disconnected = []
+        for client_id, connection in self.active_connections.items():
+            try:
+                await connection.send_json(message)
+            except:
+                disconnected.append(client_id)
+        
+        for client_id in disconnected:
+            self.disconnect(client_id)
+
+manager = ConnectionManager()
 
 # Pydantic models for request/response
 class PageBatchResponse(BaseModel):
@@ -60,9 +98,9 @@ class ErrorResponse(BaseModel):
 
 # Initialize FastAPI app
 app = FastAPI(
-    title="Simple PDF Page Processor",
-    description="Extract and clean pages from PDF ebooks in batches - Simple & Reliable",
-    version="2.1.0"
+    title="PDF Processor with WebSocket Support",
+    description="Extract and clean pages from PDF ebooks with real-time progress updates",
+    version="3.0.0"
 )
 
 # Add CORS middleware
@@ -84,6 +122,9 @@ class SimplePDFProcessor:
         self.PAGES_PER_BATCH = 10
         self.MAX_MEMORY_MB = 512
         self.MIN_BATCH_WORDS = 100
+        
+        # For WebSocket progress updates
+        self.current_client_id: Optional[str] = None
     
     def _init_replicate_client(self):
         """Initialize Replicate client if API token is available"""
@@ -98,6 +139,21 @@ class SimplePDFProcessor:
         except Exception as e:
             logger.error(f"Failed to initialize Replicate client: {e}")
             self.replicate_client = None
+    
+    async def _send_progress(self, stage: str, message: str, progress: int = 0, data: dict = None):
+        """Send progress update via WebSocket"""
+        if self.current_client_id:
+            update = {
+                "type": "progress",
+                "stage": stage,
+                "message": message,
+                "progress": progress,
+                "timestamp": datetime.now().isoformat()
+            }
+            if data:
+                update["data"] = data
+            
+            await manager.send_message(self.current_client_id, update)
     
     def _check_memory_usage(self) -> float:
         """Check current memory usage"""
@@ -115,30 +171,41 @@ class SimplePDFProcessor:
         except:
             return 0.0
     
-    def extract_pages_from_pdf(self, pdf_path: str) -> Tuple[List[Dict], int, int]:
+    async def extract_pages_from_pdf_async(self, pdf_path: str) -> Tuple[List[Dict], int, int]:
         """
-        Extract pages from PDF in batches - Simple approach like the bot
+        Extract pages from PDF in batches with WebSocket progress updates
         """
+        await self._send_progress("extraction", "Starting PDF extraction...", 0)
         logger.info(f"Starting simple PDF extraction from: {pdf_path}")
         
         try:
             # Try PyMuPDF first (better text extraction)
-            return self._extract_with_pymupdf(pdf_path)
+            result = await self._extract_with_pymupdf_async(pdf_path)
+            await self._send_progress("extraction", "PDF extraction completed", 100)
+            return result
         except Exception as e:
             logger.warning(f"PyMuPDF failed: {e}, trying PyPDF2...")
+            await self._send_progress("extraction", "Trying alternative extraction method...", 50)
             try:
-                return self._extract_with_pypdf2(pdf_path)
+                result = await self._extract_with_pypdf2_async(pdf_path)
+                await self._send_progress("extraction", "PDF extraction completed", 100)
+                return result
             except Exception as e2:
                 logger.error(f"Both extraction methods failed: {e2}")
+                await self._send_progress("extraction", f"Extraction failed: {str(e2)}", 0)
                 return [], 0, 0
     
-    def _extract_with_pymupdf(self, pdf_path: str) -> Tuple[List[Dict], int, int]:
-        """Extract using PyMuPDF - simple and reliable"""
+    async def _extract_with_pymupdf_async(self, pdf_path: str) -> Tuple[List[Dict], int, int]:
+        """Extract using PyMuPDF with async progress updates"""
         doc = fitz.open(pdf_path)
+        total_pages = len(doc)
+        
+        await self._send_progress("extraction", f"Analyzing {total_pages} pages...", 10)
         
         # Find where story starts
         start_page = self._find_story_start_page(doc)
         logger.info(f"Story starts at page {start_page}")
+        await self._send_progress("extraction", f"Story detected at page {start_page}", 20)
         
         page_batches = []
         pages_processed = 0
@@ -147,6 +214,8 @@ class SimplePDFProcessor:
         current_batch_text = ""
         current_batch_start = start_page
         batch_number = 1
+        
+        pages_to_process = total_pages - start_page
         
         for page_num in range(start_page, len(doc)):
             try:
@@ -160,6 +229,15 @@ class SimplePDFProcessor:
                     current_batch_text += page_text + "\n\n"
                     pages_processed += 1
                 
+                # Update progress
+                progress = 20 + int((page_num - start_page) / pages_to_process * 60)
+                if page_num % 5 == 0:  # Update every 5 pages
+                    await self._send_progress(
+                        "extraction", 
+                        f"Processing page {page_num + 1}/{total_pages}...",
+                        progress
+                    )
+                
                 # Check if we should finalize this batch
                 pages_in_current_batch = page_num - current_batch_start + 1
                 if pages_in_current_batch >= self.PAGES_PER_BATCH or page_num == len(doc) - 1:
@@ -170,11 +248,19 @@ class SimplePDFProcessor:
                             page_batches.append({
                                 'batch_number': batch_number,
                                 'page_range': page_range,
-                                'cleaned_text': current_batch_text.strip(),  # Use cleaned_text field
+                                'cleaned_text': current_batch_text.strip(),
                                 'word_count': word_count,
                                 'pages_in_batch': pages_in_current_batch,
                                 'cleaned': False
                             })
+                            
+                            await self._send_progress(
+                                "extraction",
+                                f"Batch {batch_number} extracted ({page_range})",
+                                progress,
+                                {"batch": batch_number, "pages": page_range}
+                            )
+                            
                             batch_number += 1
                     
                     # Reset for next batch
@@ -192,8 +278,8 @@ class SimplePDFProcessor:
         doc.close()
         return page_batches, pages_processed, start_page
     
-    def _extract_with_pypdf2(self, pdf_path: str) -> Tuple[List[Dict], int, int]:
-        """Fallback to PyPDF2"""
+    async def _extract_with_pypdf2_async(self, pdf_path: str) -> Tuple[List[Dict], int, int]:
+        """Fallback to PyPDF2 with async updates"""
         with open(pdf_path, 'rb') as file:
             pdf_reader = PyPDF2.PdfReader(file)
             total_pages = len(pdf_reader.pages)
@@ -214,14 +300,21 @@ class SimplePDFProcessor:
                     page = pdf_reader.pages[page_num]
                     page_text = page.extract_text()
                     
-                    # Basic cleaning
                     page_text = self._clean_page_text(page_text)
                     
                     if page_text.strip():
                         current_batch_text += page_text + "\n\n"
                         pages_processed += 1
                     
-                    # Check if we should finalize this batch
+                    # Progress updates
+                    if page_num % 5 == 0:
+                        progress = 20 + int((page_num - start_page) / (total_pages - start_page) * 60)
+                        await self._send_progress(
+                            "extraction",
+                            f"Processing page {page_num + 1}/{total_pages}...",
+                            progress
+                        )
+                    
                     pages_in_current_batch = page_num - current_batch_start + 1
                     if pages_in_current_batch >= self.PAGES_PER_BATCH or page_num == total_pages - 1:
                         if current_batch_text.strip():
@@ -231,17 +324,16 @@ class SimplePDFProcessor:
                                 page_batches.append({
                                     'batch_number': batch_number,
                                     'page_range': page_range,
-                                    'cleaned_text': current_batch_text.strip(),  # Use cleaned_text field
+                                    'cleaned_text': current_batch_text.strip(),
                                     'word_count': word_count,
                                     'pages_in_batch': pages_in_current_batch,
                                     'cleaned': False
                                 })
                                 batch_number += 1
                         
-                        # Reset for next batch
                         current_batch_text = ""
                         current_batch_start = page_num + 1
-                        
+                    
                 except Exception as e:
                     logger.warning(f"Error processing page {page_num}: {e}")
                     continue
@@ -249,240 +341,160 @@ class SimplePDFProcessor:
             return page_batches, pages_processed, start_page
     
     def _find_story_start_page(self, doc) -> int:
-        """Find where the actual story starts - simple approach like the bot"""
-        story_indicators = [
-            r'chapter\s+1',
-            r'chapter\s+one', 
-            r'prologue',
-            r'part\s+one',
-            r'part\s+1',
-            r'once upon a time',
-            r'it was',
-            r'the story',
-            r'in the beginning'
-        ]
-        
-        for page_num in range(min(20, len(doc))):  # Check first 20 pages
-            try:
-                page = doc.load_page(page_num)
-                text = page.get_text().lower()
-                
-                # Look for story indicators
-                for indicator in story_indicators:
-                    if re.search(indicator, text):
-                        logger.info(f"Found story indicator '{indicator}' on page {page_num}")
+        """Find where the actual story starts in the PDF"""
+        try:
+            # Keywords that indicate front matter
+            front_matter_keywords = [
+                'table of contents', 'copyright', 'dedication', 'acknowledgment',
+                'preface', 'foreword', 'introduction', 'published by', 'isbn',
+                'all rights reserved', 'contents'
+            ]
+            
+            # Look at first 20% of pages
+            max_pages_to_check = min(len(doc), max(10, len(doc) // 5))
+            
+            for page_num in range(max_pages_to_check):
+                try:
+                    page = doc.load_page(page_num)
+                    text = page.get_text().lower()
+                    
+                    # Skip if it's clearly front matter
+                    if any(keyword in text for keyword in front_matter_keywords):
+                        continue
+                    
+                    # Check if page has substantial content
+                    words = text.split()
+                    if len(words) > 100:
+                        # This looks like story content
                         return page_num
                 
-                # If page has substantial narrative content
-                if len(text) > 500 and self._is_narrative_text(text):
-                    logger.info(f"Found narrative content on page {page_num}")
-                    return page_num
-                        
-            except Exception as e:
-                logger.warning(f"Error checking page {page_num}: {e}")
-                continue
+                except Exception as e:
+                    logger.warning(f"Error checking page {page_num}: {e}")
+                    continue
+            
+            # Default: skip first few pages
+            return min(3, len(doc) - 1)
         
-        # Default: skip first 5 pages
-        default_start = min(5, len(doc) // 4)
-        logger.info(f"Using default start page: {default_start}")
-        return default_start
-    
-    def _is_narrative_text(self, text: str) -> bool:
-        """Check if text appears to be narrative content - simple approach"""
-        # Count sentences and narrative indicators
-        sentences = len(re.findall(r'[.!?]+', text))
-        narrative_words = len(re.findall(r'\b(said|asked|replied|thought|felt|saw|heard|walked|ran|looked)\b', text.lower()))
-        
-        # Check for common non-narrative patterns
-        non_narrative_patterns = [
-            r'table of contents',
-            r'copyright',
-            r'published by',
-            r'isbn',
-            r'all rights reserved',
-            r'acknowledgments',
-            r'dedication',
-            r'about the author'
-        ]
-        
-        for pattern in non_narrative_patterns:
-            if re.search(pattern, text.lower()):
-                return False
-        
-        # If it has many sentences and some narrative words, likely story content
-        return sentences > 10 and narrative_words > 5
+        except Exception as e:
+            logger.error(f"Error finding story start: {e}")
+            return 0
     
     def _clean_page_text(self, text: str) -> str:
-        """Clean page text - simple and safe like the bot"""
-        if not text:
-            return ""
-        
+        """Basic text cleaning"""
         # Remove excessive whitespace
-        text = re.sub(r'\s+', ' ', text)
+        text = re.sub(r'\n{3,}', '\n\n', text)
+        text = re.sub(r' {2,}', ' ', text)
         
-        # Remove page numbers and headers/footers - simple patterns only
+        # Remove page numbers (simple heuristic)
         text = re.sub(r'^\d+\s*$', '', text, flags=re.MULTILINE)
-        text = re.sub(r'^Page\s+\d+.*$', '', text, flags=re.MULTILINE)
-        
-        # Remove common OCR artifacts - safe character filtering
-        text = re.sub(r'[^\w\s.,!?;:"\'-]', '', text)
-        
-        # Fix common spacing issues - safe patterns only
-        text = re.sub(r'\s+([.,!?;:])', r'\1', text)
-        text = re.sub(r'([.!?])\s*([A-Z])', r'\1 \2', text)
         
         return text.strip()
     
-    async def clean_page_batch_text_with_ai(self, batch_text: str, page_range: str) -> str:
-        """Clean page batch text using GPT-4o-mini via Replicate"""
+    async def clean_batch_with_ai_async(self, batch: Dict) -> Dict:
+        """Clean a single batch with AI and send progress"""
         if not self.replicate_client:
-            logger.warning(f"Replicate client not available for pages {page_range}, skipping AI cleaning")
-            return batch_text
+            return batch
         
         try:
-            logger.info(f"Cleaning text for pages {page_range} using AI...")
+            batch_num = batch['batch_number']
+            await self._send_progress(
+                "ai_cleaning",
+                f"AI cleaning batch {batch_num}...",
+                0,
+                {"batch": batch_num}
+            )
             
-            # Truncate if too long
-            if len(batch_text) > 12000:
-                logger.info(f"Page batch too long ({len(batch_text)} chars), truncating")
-                batch_text = batch_text[:12000] + "..."
+            prompt = f"""Clean this text from an ebook. Remove:
+- Page numbers, headers, footers
+- Copyright notices, publisher info
+- Navigation elements
+- Excessive whitespace
+
+Keep only the story content. Return the cleaned text directly.
+
+Text:
+{batch['cleaned_text']}"""
+
+            output = await asyncio.to_thread(
+                lambda: self.replicate_client.run(
+                    "meta/meta-llama-3-70b-instruct",
+                    input={
+                        "prompt": prompt,
+                        "max_tokens": 4000,
+                        "temperature": 0.1
+                    }
+                )
+            )
             
-            # Simple cleaning prompt - like the bot
-            cleaning_prompt = f"""You are a professional text editor. Clean up this extracted PDF text by:
-
-1. Remove OCR artifacts and page numbers
-2. Fix broken words and sentences  
-3. Remove header/footer text and page references
-4. Correct spacing and punctuation
-5. Merge broken paragraphs properly
-6. Keep dialogue formatting intact
-7. Remove any non-story content (page numbers, chapter markers that don't belong)
-8. Maintain the original story structure and flow
-
-IMPORTANT: Only return the cleaned story text. No explanations, no additional comments, just the clean readable text.
-
-Original Text:
-{batch_text}
-
-Clean Text:"""
-
-            # Call GPT-4o-mini
-            cleaned_text = ""
-            try:
-                loop = asyncio.get_event_loop()
-                with ThreadPoolExecutor(max_workers=1) as executor:
-                    def sync_replicate_call():
-                        result = ""
-                        for event in self.replicate_client.stream(
-                            "openai/gpt-4o-mini",
-                            input={
-                                "prompt": cleaning_prompt,
-                                "max_tokens": 4000,
-                                "temperature": 0.1,
-                                "top_p": 0.9
-                            }
-                        ):
-                            result += str(event)
-                        return result
-                    
-                    cleaned_text = await loop.run_in_executor(executor, sync_replicate_call)
+            cleaned = ''.join(output).strip()
+            
+            if cleaned and len(cleaned) > 50:
+                batch['cleaned_text'] = cleaned
+                batch['word_count'] = len(cleaned.split())
+                batch['cleaned'] = True
                 
-                # Simple post-processing
-                cleaned_text = self._post_process_cleaned_text(cleaned_text)
-                
-                logger.info(f"Successfully cleaned pages {page_range}")
-                return cleaned_text
-                
-            except Exception as ai_error:
-                logger.warning(f"AI cleaning failed for pages {page_range}: {ai_error}")
-                return batch_text
-                
+                await self._send_progress(
+                    "ai_cleaning",
+                    f"Batch {batch_num} cleaned successfully",
+                    100,
+                    {"batch": batch_num, "cleaned": True}
+                )
+            
+            return batch
+        
         except Exception as e:
-            logger.error(f"Error in AI text cleaning: {e}")
-            return batch_text
+            logger.warning(f"AI cleaning failed for batch {batch['batch_number']}: {e}")
+            await self._send_progress(
+                "ai_cleaning",
+                f"Batch {batch['batch_number']} - AI cleaning failed, using basic text",
+                100,
+                {"batch": batch['batch_number'], "cleaned": False}
+            )
+            return batch
     
-    def _post_process_cleaned_text(self, text: str) -> str:
-        """Simple post-processing like the bot"""
-        if not text:
-            return ""
+    async def clean_all_page_batches_parallel_async(
+        self, 
+        page_batches: List[Dict], 
+        max_concurrent: int = 5
+    ) -> List[Dict]:
+        """Clean all batches with AI in parallel with progress updates"""
+        if not self.replicate_client:
+            logger.info("AI cleaning disabled - no Replicate client")
+            return page_batches
         
-        text = text.strip()
-        
-        # Remove AI meta-commentary
-        text = re.sub(r'^(Here is the cleaned text:|Clean Text:|Cleaned version:).*?\n', '', text, flags=re.IGNORECASE | re.MULTILINE)
-        
-        # Fix paragraph breaks
-        text = re.sub(r'\n\s*\n\s*\n+', '\n\n', text)
-        
-        # Fix quotation marks
-        text = re.sub(r'"\s+', '"', text)
-        text = re.sub(r'\s+"', '"', text)
-        
-        # Fix sentence spacing
-        text = re.sub(r'([.!?])\s*([A-Z])', r'\1 \2', text)
-        
-        # Remove excessive spaces
-        text = re.sub(r' +', ' ', text)
-        
-        return text.strip()
-    
-    async def clean_all_page_batches_parallel(self, page_batches: List[Dict], max_concurrent: int = 5) -> List[Dict]:
-        """Clean all page batches in parallel"""
-        logger.info(f"Starting AI cleaning for {len(page_batches)} page batches")
+        await self._send_progress(
+            "ai_cleaning",
+            f"Starting AI cleaning for {len(page_batches)} batches...",
+            0
+        )
         
         semaphore = asyncio.Semaphore(max_concurrent)
         
-        async def clean_single_batch(batch_index: int, batch: Dict) -> tuple[int, Dict]:
+        async def clean_with_semaphore(batch: Dict, index: int) -> Dict:
             async with semaphore:
-                try:
-                    # Get the text to clean
-                    text_to_clean = batch['cleaned_text']
-                    
-                    cleaned_text = await self.clean_page_batch_text_with_ai(
-                        text_to_clean, 
-                        batch['page_range']
-                    )
-                    
-                    cleaned_batch = {
-                        'batch_number': batch['batch_number'],
-                        'page_range': batch['page_range'],
-                        'cleaned_text': cleaned_text,  # Only cleaned_text field
-                        'word_count': len(cleaned_text.split()),
-                        'cleaned': bool(self.replicate_client),
-                        'pages_in_batch': batch['pages_in_batch']
-                    }
-                    
-                    return (batch_index, cleaned_batch)
-                    
-                except Exception as e:
-                    logger.error(f"Error cleaning batch {batch_index}: {e}")
-                    # Return original batch on error
-                    return (batch_index, batch)
+                progress = int((index / len(page_batches)) * 100)
+                await self._send_progress(
+                    "ai_cleaning",
+                    f"Cleaning batch {batch['batch_number']} ({index + 1}/{len(page_batches)})",
+                    progress
+                )
+                return await self.clean_batch_with_ai_async(batch)
         
-        # Create tasks
-        tasks = [clean_single_batch(i, batch) for i, batch in enumerate(page_batches)]
+        tasks = [
+            clean_with_semaphore(batch, i) 
+            for i, batch in enumerate(page_batches)
+        ]
         
-        # Run all tasks
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        cleaned_batches = await asyncio.gather(*tasks)
         
-        # Sort results by index
-        result_batches = [None] * len(page_batches)
-        exceptions_count = 0
+        await self._send_progress(
+            "ai_cleaning",
+            "AI cleaning completed for all batches",
+            100,
+            {"total_batches": len(cleaned_batches)}
+        )
         
-        for i, result in enumerate(results):
-            if isinstance(result, Exception):
-                logger.error(f"Exception in task {i}: {result}")
-                exceptions_count += 1
-                # Add fallback
-                result_batches[i] = page_batches[i]
-            else:
-                index, cleaned_batch = result
-                result_batches[index] = cleaned_batch
-        
-        final_batches = [batch for batch in result_batches if batch is not None]
-        
-        logger.info(f"Cleaning completed: {len(final_batches)} batches, {exceptions_count} exceptions")
-        return final_batches
+        return cleaned_batches
 
 # Initialize processor
 try:
@@ -492,26 +504,51 @@ except Exception as e:
     logger.error(f"Failed to initialize SimplePDFProcessor: {e}")
     processor = None
 
+# ============================================================================
+# WEBSOCKET ENDPOINT
+# ============================================================================
+@app.websocket("/ws/{client_id}")
+async def websocket_endpoint(websocket: WebSocket, client_id: str):
+    await manager.connect(websocket, client_id)
+    try:
+        while True:
+            # Keep connection alive and listen for messages
+            data = await websocket.receive_text()
+            # Echo back or handle client messages if needed
+            await websocket.send_json({
+                "type": "pong",
+                "message": "Connection active",
+                "timestamp": datetime.now().isoformat()
+            })
+    except WebSocketDisconnect:
+        manager.disconnect(client_id)
+    except Exception as e:
+        logger.error(f"WebSocket error for {client_id}: {e}")
+        manager.disconnect(client_id)
+
+# ============================================================================
+# HTTP ENDPOINTS
+# ============================================================================
 @app.get("/")
 async def root():
     """Root endpoint"""
     return {
-        "message": "Simple PDF Page Processor API - Reliable & Fast",
-        "version": "2.1.0",
+        "message": "PDF Processor API with WebSocket Support",
+        "version": "3.0.0",
         "status": "Running" if processor else "Limited functionality",
         "ai_enabled": bool(processor and processor.replicate_client),
-        "approach": "Simple & reliable like Telegram bot",
         "endpoints": {
-            "POST /process-pdf": "Extract page batches (10 pages each)",
+            "POST /process-pdf": "Extract page batches (basic cleaning)",
             "POST /process-pdf-with-ai": "Extract and clean with AI",
+            "WebSocket /ws/{client_id}": "Real-time progress updates",
             "GET /health": "Health check"
         },
         "features": {
-            "simple_extraction": "Basic PyMuPDF + PyPDF2 fallback",
+            "websocket_updates": "Real-time progress during processing",
+            "simple_extraction": "PyMuPDF + PyPDF2 fallback",
             "smart_story_detection": "Finds where story starts",
-            "page_batching": "10 pages per batch (0-10, 10-20, etc.)",
-            "ai_cleaning": "OpenAI via Replicate for text cleaning",
-            "reliable": "No complex regex that breaks"
+            "page_batching": "10 pages per batch",
+            "ai_cleaning": "OpenAI via Replicate for text cleaning"
         }
     }
 
@@ -531,16 +568,26 @@ async def health_check():
         "processor_available": bool(processor),
         "ai_enabled": bool(processor and processor.replicate_client),
         "memory_usage_mb": memory_usage,
-        "version": "2.1.0"
+        "active_connections": len(manager.active_connections),
+        "version": "3.0.0"
     }
 
 @app.post("/process-pdf", response_model=ProcessingResponse)
-async def process_pdf(file: UploadFile = File(...)):
-    """Extract page batches from PDF (basic cleaning only)"""
+async def process_pdf(file: UploadFile = File(...), client_id: str = None):
+    """Extract page batches from PDF with WebSocket progress updates"""
     if not processor:
         raise HTTPException(status_code=500, detail="Processor not available")
     
     start_time = datetime.now()
+    
+    # Set client ID for progress updates
+    if client_id:
+        processor.current_client_id = client_id
+        await manager.send_message(client_id, {
+            "type": "started",
+            "message": "Processing started",
+            "timestamp": datetime.now().isoformat()
+        })
     
     try:
         # Validate file
@@ -555,14 +602,21 @@ async def process_pdf(file: UploadFile = File(...)):
         
         logger.info(f"Processing PDF: {file.filename} ({file_size_mb:.1f}MB)")
         
+        if client_id:
+            await processor._send_progress(
+                "upload",
+                f"File uploaded: {file.filename} ({file_size_mb:.1f}MB)",
+                100
+            )
+        
         # Save to temp file
         with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
             tmp_file.write(contents)
             tmp_path = tmp_file.name
         
         try:
-            # Extract page batches
-            page_batches, pages_processed, story_start_page = processor.extract_pages_from_pdf(tmp_path)
+            # Extract page batches with progress updates
+            page_batches, pages_processed, story_start_page = await processor.extract_pages_from_pdf_async(tmp_path)
             
             if not page_batches:
                 raise HTTPException(
@@ -579,6 +633,18 @@ async def process_pdf(file: UploadFile = File(...)):
             batch_responses = [PageBatchResponse(**batch) for batch in page_batches]
             
             logger.info(f"Processing completed: {len(page_batches)} batches, {total_words} words")
+            
+            if client_id:
+                await manager.send_message(client_id, {
+                    "type": "completed",
+                    "message": "Processing completed successfully",
+                    "data": {
+                        "total_batches": len(page_batches),
+                        "total_words": total_words,
+                        "processing_time": processing_time
+                    },
+                    "timestamp": datetime.now().isoformat()
+                })
             
             return ProcessingResponse(
                 success=True,
@@ -597,20 +663,40 @@ async def process_pdf(file: UploadFile = File(...)):
         finally:
             if os.path.exists(tmp_path):
                 os.unlink(tmp_path)
+            processor.current_client_id = None
     
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Error processing PDF: {e}")
+        if client_id:
+            await manager.send_message(client_id, {
+                "type": "error",
+                "message": str(e),
+                "timestamp": datetime.now().isoformat()
+            })
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 @app.post("/process-pdf-with-ai", response_model=ProcessingResponse)
-async def process_pdf_with_ai(file: UploadFile = File(...), max_concurrent: int = 5):
-    """Extract and clean page batches with AI"""
+async def process_pdf_with_ai(
+    file: UploadFile = File(...), 
+    max_concurrent: int = 5,
+    client_id: str = None
+):
+    """Extract and clean page batches with AI and WebSocket progress"""
     if not processor:
         raise HTTPException(status_code=500, detail="Processor not available")
     
     start_time = datetime.now()
+    
+    # Set client ID for progress updates
+    if client_id:
+        processor.current_client_id = client_id
+        await manager.send_message(client_id, {
+            "type": "started",
+            "message": "AI processing started",
+            "timestamp": datetime.now().isoformat()
+        })
     
     try:
         # Validate file
@@ -628,6 +714,13 @@ async def process_pdf_with_ai(file: UploadFile = File(...), max_concurrent: int 
         
         logger.info(f"Processing PDF with AI: {file.filename} ({file_size_mb:.1f}MB)")
         
+        if client_id:
+            await processor._send_progress(
+                "upload",
+                f"File uploaded: {file.filename} ({file_size_mb:.1f}MB)",
+                100
+            )
+        
         # Save to temp file
         with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
             tmp_file.write(contents)
@@ -635,7 +728,7 @@ async def process_pdf_with_ai(file: UploadFile = File(...), max_concurrent: int 
         
         try:
             # Extract page batches
-            page_batches, pages_processed, story_start_page = processor.extract_pages_from_pdf(tmp_path)
+            page_batches, pages_processed, story_start_page = await processor.extract_pages_from_pdf_async(tmp_path)
             
             if not page_batches:
                 raise HTTPException(
@@ -646,7 +739,10 @@ async def process_pdf_with_ai(file: UploadFile = File(...), max_concurrent: int 
             logger.info(f"Extracted {len(page_batches)} batches. Starting AI cleaning...")
             
             # Clean with AI
-            cleaned_batches = await processor.clean_all_page_batches_parallel(page_batches, max_concurrent)
+            cleaned_batches = await processor.clean_all_page_batches_parallel_async(
+                page_batches, 
+                max_concurrent
+            )
             
             # Calculate stats
             total_words = sum(batch['word_count'] for batch in cleaned_batches)
@@ -659,6 +755,19 @@ async def process_pdf_with_ai(file: UploadFile = File(...), max_concurrent: int 
             batch_responses = [PageBatchResponse(**batch) for batch in cleaned_batches]
             
             ai_status = "with AI cleaning" if processor.replicate_client else "basic cleaning only (AI unavailable)"
+            
+            if client_id:
+                await manager.send_message(client_id, {
+                    "type": "completed",
+                    "message": f"Processing completed {ai_status}",
+                    "data": {
+                        "total_batches": len(cleaned_batches),
+                        "ai_cleaned": ai_cleaned_count,
+                        "total_words": total_words,
+                        "processing_time": processing_time
+                    },
+                    "timestamp": datetime.now().isoformat()
+                })
             
             return ProcessingResponse(
                 success=True,
@@ -677,11 +786,18 @@ async def process_pdf_with_ai(file: UploadFile = File(...), max_concurrent: int 
         finally:
             if os.path.exists(tmp_path):
                 os.unlink(tmp_path)
+            processor.current_client_id = None
     
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Error processing PDF with AI: {e}")
+        if client_id:
+            await manager.send_message(client_id, {
+                "type": "error",
+                "message": str(e),
+                "timestamp": datetime.now().isoformat()
+            })
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 if __name__ == "__main__":
@@ -689,11 +805,11 @@ if __name__ == "__main__":
     
     port = int(os.environ.get("PORT", 8000))
     
-    print("🚀 Starting Simple PDF Page Processor API...")
-    print("📚 Simple & reliable approach like Telegram bot")
-    print("🔍 Focus: Story detection + basic extraction")
-    print("🧹 AI cleaning: Let OpenAI handle the complex stuff")
-    print("✅ No complex regex patterns that break")
+    print("🚀 Starting PDF Processor API with WebSocket Support...")
+    print("📡 WebSocket endpoint: /ws/{client_id}")
+    print("📚 Real-time progress updates enabled")
+    print("🔍 Story detection + batch extraction")
+    print("🧹 AI cleaning available")
     
     if os.environ.get("REPLICATE_API_TOKEN"):
         print("✅ AI cleaning enabled (Replicate + OpenAI)")
