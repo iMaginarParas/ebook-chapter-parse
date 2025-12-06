@@ -15,17 +15,21 @@ from openai import AsyncOpenAI  # DeepSeek is OpenAI Compatible
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
+# Read from Railway Environment Variables
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY") 
 BASE_URL = "https://api.deepseek.com"
 MODEL_NAME = "deepseek-chat" 
 
+# Validation log (won't crash app, but helps debug)
 if not DEEPSEEK_API_KEY:
-    print("❌ ERROR: DEEPSEEK_API_KEY is missing!")
+    print("❌ WARNING: DEEPSEEK_API_KEY is missing in environment variables!")
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 logger = logging.getLogger("DeepSeekScanner")
 
 app = FastAPI()
+
+# Enable CORS for frontend access
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -71,45 +75,59 @@ books_db = {}
 # ============================================================================
 class DeepSeekAnalyzer:
     def __init__(self):
-        self.client = AsyncOpenAI(api_key=DEEPSEEK_API_KEY, base_url=BASE_URL)
+        # Initialize client only if key exists, otherwise let it fail gracefully later
+        if DEEPSEEK_API_KEY:
+            self.client = AsyncOpenAI(api_key=DEEPSEEK_API_KEY, base_url=BASE_URL)
+        else:
+            self.client = None
 
     async def process_book(self, book_id: str, file_path: str, client_id: str):
+        if not self.client:
+            await ws_manager.send_log(client_id, "❌ Server Error: API Key missing.", "error")
+            return
+
         await ws_manager.send_log(client_id, "📖 Extracting text from PDF...")
         
-        doc = fitz.open(file_path)
-        full_text_map = [] 
-        llm_input_lines = []
-        
-        for i, page in enumerate(doc):
-            text = page.get_text()
-            full_text_map.append(text) 
-            # Send page number + first 1000 chars to AI
-            clean_excerpt = text[:1000].replace('\n', ' ')
-            llm_input_lines.append(f"PAGE_ID_{i}: {clean_excerpt}")
-
-        doc.close()
-        
-        context_str = "\n".join(llm_input_lines)
-        
-        # Truncate if over 128k tokens (approx 500k chars)
-        if len(context_str) > 500000:
-            await ws_manager.send_log(client_id, "⚠️ Book is huge! Truncating...", "warning")
-            context_str = context_str[:500000]
-
-        await ws_manager.send_log(client_id, f"🚀 Sending {len(context_str)} chars to DeepSeek V3...", "info")
-
         try:
+            doc = fitz.open(file_path)
+            full_text_map = [] 
+            llm_input_lines = []
+            
+            for i, page in enumerate(doc):
+                text = page.get_text()
+                full_text_map.append(text) 
+                # Send page number + first 1000 chars to AI (Skeleton Strategy)
+                clean_excerpt = text[:1000].replace('\n', ' ')
+                llm_input_lines.append(f"PAGE_ID_{i}: {clean_excerpt}")
+
+            doc.close()
+            
+            context_str = "\n".join(llm_input_lines)
+            
+            # Truncate if over 128k tokens (approx 500k chars) safety limit
+            if len(context_str) > 500000:
+                await ws_manager.send_log(client_id, "⚠️ Book is huge! Truncating to fit context...", "warning")
+                context_str = context_str[:500000]
+
+            await ws_manager.send_log(client_id, f"🚀 Sending {len(context_str)} chars to DeepSeek V3...", "info")
+
             chapters_metadata = await self.ask_deepseek(context_str)
             
+            if not chapters_metadata:
+                 await ws_manager.send_log(client_id, "⚠️ AI returned no chapters. Is the book empty?", "warning")
+                 return
+
             await ws_manager.send_log(client_id, f"✅ DeepSeek identified {len(chapters_metadata)} chapters!", "success")
             
+            # Reconstruct Full Text based on Page Boundaries
             final_output = []
             for chap in chapters_metadata:
                 start = chap.get("start_page", 0)
                 end = chap.get("end_page", 0)
                 
-                # Retrieve Full Text
+                # Retrieve Full Text locally
                 chapter_text = ""
+                # Clamp values to valid page ranges
                 start = max(0, min(start, len(full_text_map)-1))
                 end = max(0, min(end, len(full_text_map)-1))
                 
@@ -157,13 +175,21 @@ class DeepSeekAnalyzer:
         )
         
         content = response.choices[0].message.content
-        return json.loads(content).get("chapters", []) if "chapters" in content else json.loads(content)
+        # Handle cases where DeepSeek wraps json in a key like "chapters": [...]
+        data = json.loads(content)
+        return data.get("chapters", data) if isinstance(data, dict) else data
 
 analyzer = DeepSeekAnalyzer()
 
 # ============================================================================
 # ENDPOINTS
 # ============================================================================
+
+# --- HEALTH CHECK FOR RAILWAY ---
+@app.get("/health")
+async def health_check():
+    return {"status": "healthy"}
+
 @app.websocket("/ws/{client_id}")
 async def websocket_endpoint(websocket: WebSocket, client_id: str):
     await ws_manager.connect(websocket, client_id)
@@ -190,4 +216,7 @@ async def get_chapter(book_id: str, index: int):
     return {"error": "Not found"}
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    # --- DYNAMIC PORT FOR RAILWAY ---
+    port = int(os.environ.get("PORT", 8000))
+    print(f"🚀 Starting server on port {port}...")
+    uvicorn.run(app, host="0.0.0.0", port=port)
