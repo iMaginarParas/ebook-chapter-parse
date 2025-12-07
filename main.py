@@ -3,33 +3,28 @@ import logging
 import json
 import uuid
 import asyncio
-from typing import List, Dict
+from typing import List, Dict, Optional
 
 import fitz  # PyMuPDF
 import uvicorn
-# Added BackgroundTasks to imports
-from fastapi import FastAPI, UploadFile, File, WebSocket, WebSocketDisconnect, BackgroundTasks
+import httpx  # Required for sending webhooks
+from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from openai import AsyncOpenAI  # DeepSeek is OpenAI Compatible
+from openai import AsyncOpenAI
 
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-# Read from Railway Environment Variables
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY") 
 BASE_URL = "https://api.deepseek.com"
 MODEL_NAME = "deepseek-chat" 
-
-# Validation log (won't crash app, but helps debug)
-if not DEEPSEEK_API_KEY:
-    print("❌ WARNING: DEEPSEEK_API_KEY is missing in environment variables!")
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 logger = logging.getLogger("DeepSeekScanner")
 
 app = FastAPI()
 
-# Enable CORS for frontend access
+# Enable CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -37,62 +32,63 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ============================================================================
-# WEBSOCKET MANAGER
-# ============================================================================
-class ConnectionManager:
-    def __init__(self):
-        self.active_connections: Dict[str, WebSocket] = {}
-
-    async def connect(self, websocket: WebSocket, client_id: str):
-        await websocket.accept()
-        self.active_connections[client_id] = websocket
-
-    def disconnect(self, client_id: str):
-        if client_id in self.active_connections:
-            del self.active_connections[client_id]
-
-    async def send_log(self, client_id: str, message: str, level: str = "info"):
-        print(f"[{client_id}] {message}")
-        if client_id in self.active_connections:
-            try:
-                await self.active_connections[client_id].send_json({
-                    "type": "log", "level": level, "message": message
-                })
-            except: pass
-
-    async def send_result(self, client_id: str, data: dict):
-        if client_id in self.active_connections:
-            await self.active_connections[client_id].send_json({
-                "type": "result", "data": data
-            })
-
-ws_manager = ConnectionManager()
+# Optional: Keep an in-memory DB if you still want to fetch results manually later
 books_db = {}
+
+# ============================================================================
+# WEBHOOK HELPER
+# ============================================================================
+async def send_webhook(url: str, payload: dict):
+    """
+    Sends the processing result to the provided callback URL.
+    """
+    if not url:
+        return
+
+    logger.info(f"🚀 Sending webhook to {url}...")
+    async with httpx.AsyncClient() as client:
+        try:
+            # We assume the client expects a POST request with a JSON body
+            response = await client.post(url, json=payload, timeout=20.0)
+            logger.info(f"✅ Webhook sent to {url}. Status: {response.status_code}")
+        except Exception as e:
+            logger.error(f"❌ Failed to send webhook to {url}: {e}")
 
 # ============================================================================
 # DEEPSEEK LOGIC
 # ============================================================================
 class DeepSeekAnalyzer:
     def __init__(self):
-        # Initialize client only if key exists, otherwise let it fail gracefully later
         if DEEPSEEK_API_KEY:
             self.client = AsyncOpenAI(api_key=DEEPSEEK_API_KEY, base_url=BASE_URL)
         else:
             self.client = None
 
-    async def process_book(self, book_id: str, file_path: str, client_id: str):
-        if not self.client:
-            await ws_manager.send_log(client_id, "❌ Server Error: API Key missing.", "error")
-            return
+    async def process_book(self, book_id: str, file_path: str, webhook_url: str):
+        """
+        Background task that processes the PDF and triggers a webhook upon completion.
+        """
+        result_payload = {
+            "book_id": book_id,
+            "status": "processing",
+            "data": None,
+            "error": None
+        }
 
-        await ws_manager.send_log(client_id, "📖 Extracting text from PDF...")
+        # 1. Validation
+        if not self.client:
+            result_payload["status"] = "failed"
+            result_payload["error"] = "Server Error: API Key missing."
+            await send_webhook(webhook_url, result_payload)
+            return
         
         try:
+            logger.info(f"[{book_id}] 📖 Extracting text from PDF...")
             doc = fitz.open(file_path)
             full_text_map = [] 
             llm_input_lines = []
             
+            # 2. Extract Text & Create Skeleton
             for i, page in enumerate(doc):
                 text = page.get_text()
                 full_text_map.append(text) 
@@ -104,22 +100,24 @@ class DeepSeekAnalyzer:
             
             context_str = "\n".join(llm_input_lines)
             
-            # Truncate if over 128k tokens (approx 500k chars) safety limit
+            # Truncate if over safety limit (approx 500k chars)
             if len(context_str) > 500000:
-                await ws_manager.send_log(client_id, "⚠️ Book is huge! Truncating to fit context...", "warning")
+                logger.warning(f"[{book_id}] ⚠️ Book is huge! Truncating...")
                 context_str = context_str[:500000]
 
-            await ws_manager.send_log(client_id, f"🚀 Sending {len(context_str)} chars to DeepSeek V3...", "info")
-
+            # 3. Ask AI
+            logger.info(f"[{book_id}] 🚀 Sending to DeepSeek V3...")
             chapters_metadata = await self.ask_deepseek(context_str)
             
             if not chapters_metadata:
-                 await ws_manager.send_log(client_id, "⚠️ AI returned no chapters. Is the book empty?", "warning")
-                 return
+                result_payload["status"] = "failed"
+                result_payload["error"] = "AI returned no chapters. Is the book empty?"
+                await send_webhook(webhook_url, result_payload)
+                return
 
-            await ws_manager.send_log(client_id, f"✅ DeepSeek identified {len(chapters_metadata)} chapters!", "success")
-            
-            # Reconstruct Full Text based on Page Boundaries
+            logger.info(f"[{book_id}] ✅ Identified {len(chapters_metadata)} chapters.")
+
+            # 4. Reconstruct Full Text based on Page Boundaries
             final_output = []
             for chap in chapters_metadata:
                 start = chap.get("start_page", 0)
@@ -140,11 +138,25 @@ class DeepSeekAnalyzer:
                     "text": chapter_text
                 })
 
+            # Save to local memory (optional backup)
             books_db[book_id] = final_output
-            await ws_manager.send_result(client_id, final_output)
+
+            # 5. Success Webhook
+            result_payload["status"] = "completed"
+            result_payload["data"] = final_output
+            await send_webhook(webhook_url, result_payload)
 
         except Exception as e:
-            await ws_manager.send_log(client_id, f"DeepSeek Error: {str(e)}", "error")
+            logger.error(f"[{book_id}] DeepSeek Error: {str(e)}")
+            result_payload["status"] = "failed"
+            result_payload["error"] = str(e)
+            await send_webhook(webhook_url, result_payload)
+
+        finally:
+            # 6. Cleanup
+            if os.path.exists(file_path):
+                os.remove(file_path)
+                logger.info(f"[{book_id}] 🧹 Temp file cleaned up.")
 
     async def ask_deepseek(self, context: str):
         prompt = f"""
@@ -175,9 +187,12 @@ class DeepSeekAnalyzer:
         )
         
         content = response.choices[0].message.content
-        # Handle cases where DeepSeek wraps json in a key like "chapters": [...]
-        data = json.loads(content)
-        return data.get("chapters", data) if isinstance(data, dict) else data
+        try:
+            data = json.loads(content)
+            # Handle cases where DeepSeek wraps json in a key like "chapters": [...]
+            return data.get("chapters", data) if isinstance(data, dict) else data
+        except json.JSONDecodeError:
+            return None
 
 analyzer = DeepSeekAnalyzer()
 
@@ -185,38 +200,46 @@ analyzer = DeepSeekAnalyzer()
 # ENDPOINTS
 # ============================================================================
 
-# --- HEALTH CHECK FOR RAILWAY ---
 @app.get("/health")
 async def health_check():
     return {"status": "healthy"}
 
-@app.websocket("/ws/{client_id}")
-async def websocket_endpoint(websocket: WebSocket, client_id: str):
-    await ws_manager.connect(websocket, client_id)
-    try:
-        while True: await websocket.receive_text()
-    except WebSocketDisconnect:
-        ws_manager.disconnect(client_id)
-
 @app.post("/upload")
-async def upload_book(background_tasks: BackgroundTasks, file: UploadFile = File(...), client_id: str = "default"):
+async def upload_book(
+    background_tasks: BackgroundTasks, 
+    file: UploadFile = File(...), 
+    webhook_url: str = Form(...)  # Client must provide where to send results
+):
+    """
+    Receives a file, starts processing in the background, and returns immediately.
+    The result will be sent to 'webhook_url' via POST.
+    """
     book_id = str(uuid.uuid4())
     file_path = f"temp_{book_id}.pdf"
-    content = await file.read()
-    with open(file_path, "wb") as f: f.write(content)
     
-    background_tasks.add_task(analyzer.process_book, book_id, file_path, client_id)
-    return {"book_id": book_id}
+    # Save file temporarily
+    content = await file.read()
+    with open(file_path, "wb") as f: 
+        f.write(content)
+    
+    # Queue the heavy lifting
+    background_tasks.add_task(analyzer.process_book, book_id, file_path, webhook_url)
+    
+    return {
+        "message": "File accepted. Processing started in background.",
+        "book_id": book_id,
+        "callback_target": webhook_url
+    }
 
-@app.get("/book/{book_id}/chapter/{index}")
-async def get_chapter(book_id: str, index: int):
-    chapters = books_db.get(book_id, [])
-    for c in chapters:
-        if c["index"] == index: return c
-    return {"error": "Not found"}
+# Optional: Fallback endpoint if webhook fails and you want to poll manually
+@app.get("/book/{book_id}/chapters")
+async def get_chapters_manual(book_id: str):
+    if book_id in books_db:
+        return {"status": "completed", "data": books_db[book_id]}
+    return {"status": "not_found_or_processing"}
 
 if __name__ == "__main__":
     # --- DYNAMIC PORT FOR RAILWAY ---
     port = int(os.environ.get("PORT", 8000))
-    print(f"🚀 Starting server on port {port}...")
+    print(f"🚀 Starting Webhook Server on port {port}...")
     uvicorn.run(app, host="0.0.0.0", port=port)

@@ -4,3 +4,4 @@ pymupdf
 openai
 python-multipart
 python-dotenv
+httpx
